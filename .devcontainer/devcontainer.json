@@ -1,0 +1,98 @@
+// VS Code Dev Containers configuration.
+// Spec: https://containers.dev/implementors/json_reference/
+// Comments are permitted (JSONC).
+{
+  "name": "claude-dev-template",
+
+  // Build the image from the sibling Dockerfile.
+  "build": {
+    "dockerfile": "Dockerfile"
+  },
+
+  // The folder VS Code opens inside the container. Must match the bind
+  // mount target below.
+  "workspaceFolder": "/workspace",
+
+  // Bind mounts pass host resources straight through to the container.
+  // Nothing here is copied — edits are written to the host filesystem.
+  "mounts": [
+    // The project itself. ${localWorkspaceFolder} is whatever folder you
+    // opened in VS Code on the host.
+    "source=${localWorkspaceFolder},target=/workspace,type=bind",
+
+    // GPG public keyring + agent socket directory: lets `git` inside the
+    // container sign commits with the host's private keys without ever
+    // exposing the keys themselves.
+    "source=${localEnv:HOME}/.gnupg/pubring.gpg,target=/home/vscode/.gnupg/pubring.gpg,type=bind,consistency=cached",
+    "source=/run/user/1000/gnupg,target=/run/user/1000/gnupg,type=bind",
+
+    // Host gitconfig (read-only) so name/email/signingkey come through
+    // automatically — no need to re-`git config` per container.
+    "source=${localEnv:HOME}/.gitconfig,target=/home/vscode/.gitconfig,type=bind,consistency=cached,readonly",
+
+    // Optional: a host directory of named sockets (used by some
+    // out-of-container helpers). Safe to remove if you don't use them.
+    "source=${localEnv:HOME}/.sockets,target=/workspace/.sockets,type=bind"
+  ],
+
+  // Environment variables visible to the user's shell and to VS Code's
+  // integrated terminal. ${localEnv:X} reads X from the host.
+  "remoteEnv": {
+    "ANTHROPIC_API_KEY": "${localEnv:ANTHROPIC_API_KEY}",
+    // Per-project keys — leave blank in the template, fill in per repo.
+    "ZOTERO_API_KEY": "",
+    "ZOTERO_USER_ID": "",
+    // Use the gpg-agent's SSH socket as the ssh-agent — one agent for
+    // both signing and `git push` over SSH.
+    "SSH_AUTH_SOCK": "/run/user/1000/gnupg/S.gpg-agent.ssh"
+  },
+
+  "remoteUser": "vscode",
+
+  // Runs once, after the container is first created.
+  //   1. Symlink the gpg-agent sockets into ~/.gnupg so gpg/ssh find them.
+  //   2. Install the `claude` CLI from the official installer. The 120s
+  //      timeout + `|| echo` makes the install best-effort: if the
+  //      network is flaky the container still comes up.
+  "postCreateCommand": "bash -c 'ln -sf /run/user/1000/gnupg/S.gpg-agent /home/vscode/.gnupg/S.gpg-agent; ln -sf /run/user/1000/gnupg/S.gpg-agent.ssh /home/vscode/.gnupg/S.gpg-agent.ssh; timeout 120 bash -c \"curl -fsSL https://claude.ai/install.sh | bash\" || echo \"[postCreate] claude CLI install failed or timed out, continuing\"; exit 0'",
+
+  // Runs on every container start. Cron is used by some agentic
+  // workflows for scheduled jobs; `|| true` keeps boot non-fatal if
+  // cron is absent.
+  "postStartCommand": "sudo service cron start || true",
+
+  "customizations": {
+    "vscode": {
+      // Extensions auto-installed inside the container's VS Code Server.
+      "extensions": [
+        "ms-python.python",
+        "ms-python.pylance",
+        "anthropic.claude-code",
+        "charliermarsh.ruff",
+        "github.copilot",
+        "github.copilot-chat"
+      ],
+      // Per-workspace VS Code settings. Latex-Workshop is wired up to
+      // build with latexmk → PDF, with synctex for forward/inverse search.
+      "settings": {
+        "python.defaultInterpreterPath": "/usr/local/bin/python",
+        "latex-workshop.latex.tools": [
+          {
+            "name": "latexmk",
+            "command": "latexmk",
+            "args": ["-pdf", "-interaction=nonstopmode", "-synctex=1", "%DOC%"]
+          }
+        ],
+        "latex-workshop.latex.recipes": [
+          {
+            "name": "latexmk",
+            "tools": ["latexmk"]
+          }
+        ],
+        // Build output next to the .tex source instead of a build/ subdir.
+        "latex-workshop.latex.outDir": "%DIR%",
+        "latex-workshop.synctex.afterBuild.enabled": true
+      }
+    }
+  }
+}

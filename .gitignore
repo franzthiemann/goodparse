@@ -1,0 +1,47 @@
+# Byte-compiled / optimized
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+*.egg
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Test / coverage artifacts
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.mypy_cache/
+.ruff_cache/
+
+# Converter output (generated from samples)
+*.xopp
+samples/**/thumbnail.jpg.out
+
+# Editor / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# Agent / session scratch (environment-specific, not project code)
+.claude/
+.remember/
+.agents/
+.sockets/
+tasks/
+
+# Prototype scripts superseded by the package
+/pbdump.py
+/applelz4.py

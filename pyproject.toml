@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "goodnotes2xournal"
+version = "0.1.0"
+description = "Convert GoodNotes files to editable Xournal++ documents, preserving strokes."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "Franz Thiemann" }]
+keywords = ["goodnotes", "xournal", "xournalpp", "notes", "converter"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Topic :: Utilities",
+]
+dependencies = []
+
+[project.scripts]
+goodnotes2xournal = "goodnotes2xournal.cli:main"
+
+[project.optional-dependencies]
+test = ["pytest"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
