@@ -5,7 +5,7 @@ from __future__ import annotations
 import argparse
 import sys
 
-from . import __version__, convert_file
+from . import FORMATS, __version__, convert_file
 from .goodnotes import parse_goodnotes
 from .xournal import DEFAULT_WIDTH_SCALE
 
@@ -13,10 +13,16 @@ from .xournal import DEFAULT_WIDTH_SCALE
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(
         prog="goodnotes2xournal",
-        description="Convert GoodNotes (.goodnotes) files to Xournal++ (.xopp).",
+        description="Convert GoodNotes (.goodnotes) files to "
+                    "Xournal++ (.xopp) or Excalidraw (.excalidraw).",
     )
     parser.add_argument("input", help="path to a .goodnotes file or extracted folder")
-    parser.add_argument("-o", "--output", help="output .xopp path (default: alongside input)")
+    parser.add_argument("-o", "--output",
+                        help="output path (default: alongside input)")
+    parser.add_argument(
+        "-f", "--format", choices=FORMATS, dest="fmt",
+        help="output format (default: from the output extension, else xopp)",
+    )
     parser.add_argument(
         "-w", "--width-scale", type=float, default=DEFAULT_WIDTH_SCALE, dest="width_scale",
         help=f"multiplier on GoodNotes' stroke widths (default: {DEFAULT_WIDTH_SCALE})",
@@ -32,7 +38,8 @@ def main(argv=None) -> int:
             doc = parse_goodnotes(args.input)
             for i, page in enumerate(doc.pages):
                 print(f"page {i + 1}: {len(page.strokes)} stroke(s)", file=sys.stderr)
-        out = convert_file(args.input, args.output, width_scale=args.width_scale)
+        out = convert_file(args.input, args.output,
+                           width_scale=args.width_scale, fmt=args.fmt)
     except (OSError, ValueError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1

@@ -1,6 +1,7 @@
 """End-to-end tests against the reverse-engineered sample files."""
 
 import gzip
+import json
 import os
 import xml.etree.ElementTree as ET
 
@@ -8,6 +9,7 @@ import pytest
 
 from goodnotes2xournal import convert_file, parse_goodnotes
 from goodnotes2xournal.applelz4 import apple_decompress, lz4_block_decompress
+from goodnotes2xournal.excalidraw import color_to_rgb_hex
 from goodnotes2xournal.goodnotes import extract_points
 from goodnotes2xournal.xournal import color_to_hex
 
@@ -87,6 +89,57 @@ def test_test4_thick_pens_detected():
     assert blue_w > 2.0          # thick pen
     assert red_w < 1.5           # thin pen
     assert blue_w > red_w * 2
+
+
+# --------------------------------------------------------------------------- #
+# Integration: writing valid .excalidraw
+# --------------------------------------------------------------------------- #
+
+def test_convert_file_produces_valid_excalidraw(tmp_path):
+    out = convert_file(sample("Test4.goodnotes"), str(tmp_path / "out.excalidraw"))
+    with open(out, encoding="utf-8") as fh:
+        scene = json.load(fh)
+    assert scene["type"] == "excalidraw"
+    assert scene["version"] == 2
+
+    strokes = [e for e in scene["elements"] if e["type"] == "freedraw"]
+    frames = [e for e in scene["elements"] if e["type"] == "rectangle"]
+    assert len(strokes) == 5
+    assert len(frames) == 1 and frames[0]["locked"]
+
+    expected = {"#d20000", "#007aff", "#f59a23", "#007355", "#ff9797"}
+    assert {s["strokeColor"] for s in strokes} == expected
+    for s in strokes:
+        # one pressure per point, first point at the element origin
+        assert len(s["pressures"]) == len(s["points"]) >= 40
+        assert all(0.0 < p <= 1.0 for p in s["pressures"])
+        assert s["simulatePressure"] is False
+        assert min(p[0] for p in s["points"]) == 0.0
+        assert min(p[1] for p in s["points"]) == 0.0
+
+
+def test_excalidraw_pages_stacked_and_dot_rendered(tmp_path):
+    # test3 has two dot strokes; also checks single-point strokes get 2 points
+    out = convert_file(sample("test3.goodnotes"), str(tmp_path / "out.excalidraw"))
+    with open(out, encoding="utf-8") as fh:
+        scene = json.load(fh)
+    strokes = [e for e in scene["elements"] if e["type"] == "freedraw"]
+    assert len(strokes) == 2
+    assert all(len(s["points"]) >= 2 for s in strokes)
+
+
+def test_excalidraw_color_and_format_dispatch():
+    assert color_to_rgb_hex((1.0, 0.0, 0.0, 1.0)) == "#ff0000"
+    assert color_to_rgb_hex((0.0, 0.4784, 1.0, 0.5)) == "#007aff"
+    with pytest.raises(ValueError):
+        convert_file(sample("test2.goodnotes"), fmt="svg")
+
+
+def test_explicit_format_overrides_extension(tmp_path):
+    out = convert_file(sample("test2.goodnotes"), str(tmp_path / "out.json"),
+                       fmt="excalidraw")
+    with open(out, encoding="utf-8") as fh:
+        assert json.load(fh)["type"] == "excalidraw"
 
 
 # --------------------------------------------------------------------------- #

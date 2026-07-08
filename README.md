@@ -1,7 +1,8 @@
 # goodnotes2xournal
 
 Convert **GoodNotes** (`.goodnotes`) files into editable **Xournal++** (`.xopp`)
-documents, preserving strokes (geometry, colour, and per-point width).
+or **Excalidraw** (`.excalidraw`) documents, preserving strokes (geometry,
+colour, and per-point width).
 
 Pure Python, no third-party runtime dependencies.
 
@@ -16,9 +17,11 @@ pip install -e .
 ### CLI
 
 ```bash
-goodnotes2xournal notes.goodnotes              # -> notes.xopp
-goodnotes2xournal notes.goodnotes -o out.xopp  # explicit output
-goodnotes2xournal notes.goodnotes -w 1.5 -v    # 1.5x stroke widths, verbose
+goodnotes2xournal notes.goodnotes                    # -> notes.xopp
+goodnotes2xournal notes.goodnotes -o out.xopp        # explicit output
+goodnotes2xournal notes.goodnotes -o out.excalidraw  # format from extension
+goodnotes2xournal notes.goodnotes -f excalidraw      # -> notes.excalidraw
+goodnotes2xournal notes.goodnotes -w 1.5 -v          # 1.5x stroke widths, verbose
 ```
 
 ### Library
@@ -33,7 +36,18 @@ for page in doc.pages:
         stroke.color   # (r, g, b, a) floats 0..1
 
 convert_file("notes.goodnotes", "notes.xopp")
+convert_file("notes.goodnotes", "notes.excalidraw")   # format from extension
+convert_file("notes.goodnotes", fmt="excalidraw")     # explicit format
 ```
+
+### Excalidraw export
+
+Each stroke becomes a `freedraw` element: GoodNotes' per-point widths map to
+Excalidraw pressures (with `strokeWidth` set to the stroke's maximum width),
+so thin/thick pens and pressure tapering are preserved, though Excalidraw's
+freehand renderer makes the exact thickness an approximation. Pages are laid
+out top-to-bottom on the canvas, each outlined by a locked rectangle marking
+the page bounds. Colour alpha maps to element opacity.
 
 ## Reverse-engineered format notes
 
