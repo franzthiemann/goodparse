@@ -1,8 +1,8 @@
 # goodparse
 
-Convert **GoodNotes** (`.goodnotes`) files into editable **Xournal++** (`.xopp`)
-or **Excalidraw** (`.excalidraw`) documents, preserving strokes (geometry,
-colour, and per-point width).
+Convert **GoodNotes** (`.goodnotes`) files into editable **Xournal++** (`.xopp`),
+**Excalidraw** (`.excalidraw`), or **PDF** (`.pdf`) documents, preserving strokes
+(geometry, colour, and per-point width).
 
 Pure Python, no third-party runtime dependencies.
 
@@ -21,8 +21,11 @@ goodparse notes.goodnotes                    # -> notes.xopp
 goodparse notes.goodnotes -o out.xopp        # explicit output
 goodparse notes.goodnotes -o out.excalidraw  # format from extension
 goodparse notes.goodnotes -f excalidraw      # -> notes.excalidraw
+goodparse notes.goodnotes -o out.pdf         # -> out.pdf
 goodparse notes.goodnotes -w 1.5 -v          # 1.5x stroke widths, verbose
 ```
+
+*(The legacy command `goodnotes2xournal` is also kept as an alias.)*
 
 ### Library
 
@@ -37,6 +40,7 @@ for page in doc.pages:
 
 convert_file("notes.goodnotes", "notes.xopp")
 convert_file("notes.goodnotes", "notes.excalidraw")   # format from extension
+convert_file("notes.goodnotes", "notes.pdf")
 convert_file("notes.goodnotes", fmt="excalidraw")     # explicit format
 ```
 
@@ -48,6 +52,19 @@ so thin/thick pens and pressure tapering are preserved, though Excalidraw's
 freehand renderer makes the exact thickness an approximation. Pages are laid
 out top-to-bottom on the canvas, each outlined by a locked rectangle marking
 the page bounds. Colour alpha maps to element opacity.
+
+### PDF export
+
+PDF's coordinate space is a 1:1 match for GoodNotes (PDF points @72 dpi, same
+page size) except for the origin: GoodNotes is top-left, PDF is bottom-left, so
+each point is Y-flipped per page (`y_pdf = page.height - y`). Because a PDF path
+has a *constant* line width, a pressure-varying stroke is drawn as one round-cap
+segment per point, each at the mean of its two endpoint widths — overlapping
+round caps blend into a smooth stroke whose thickness follows the original
+per-point widths. Colour alpha maps to a shared `/ExtGState` (`/ca` and `/CA`).
+The file is a hand-built, minimally valid PDF 1.4 (stdlib `zlib` only):
+uncompressed dictionaries, Flate-compressed content streams, and a linear
+xref/trailer.
 
 ## Reverse-engineered format notes
 
@@ -79,7 +96,8 @@ Key details discovered from the sample files:
 
 ## Status / limitations
 
-Implemented: multi-page documents, pen strokes, colour, per-point width.
+Implemented: multi-page documents, pen strokes, colour, per-point width — to
+Xournal++ (`.xopp`), Excalidraw (`.excalidraw`), and PDF (`.pdf`).
 
 Not yet handled (would need more varied samples): highlighter/fountain pen-type
 distinctions, eraser strokes, embedded images and PDF page backgrounds, and text

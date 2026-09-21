@@ -5,12 +5,12 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "goodparse"
 version = "0.1.0"
-description = "Convert GoodNotes files to editable Xournal++ documents, preserving strokes."
+description = "Convert GoodNotes files to editable Xournal++ or Excalidraw documents, or PDF, preserving strokes."
 readme = "README.md"
 requires-python = ">=3.9"
 license = { text = "MIT" }
 authors = [{ name = "Franz Thiemann" }]
-keywords = ["goodnotes", "xournal", "xournalpp", "notes", "converter"]
+keywords = ["goodnotes", "xournal", "xournalpp", "excalidraw", "pdf", "notes", "converter"]
 classifiers = [
     "Programming Language :: Python :: 3",
     "Topic :: Utilities",
@@ -19,6 +19,7 @@ dependencies = []
 
 [project.scripts]
 goodparse = "goodparse.cli:main"
+goodnotes2xournal = "goodparse.cli:main"
 
 [project.optional-dependencies]
 test = ["pytest"]

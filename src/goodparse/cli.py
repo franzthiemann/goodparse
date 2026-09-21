@@ -14,7 +14,7 @@ def main(argv=None) -> int:
     parser = argparse.ArgumentParser(
         prog="goodparse",
         description="Convert GoodNotes (.goodnotes) files to "
-                    "Xournal++ (.xopp) or Excalidraw (.excalidraw).",
+                    "Xournal++ (.xopp), Excalidraw (.excalidraw), or PDF (.pdf).",
     )
     parser.add_argument("input", help="path to a .goodnotes file or extracted folder")
     parser.add_argument("-o", "--output",

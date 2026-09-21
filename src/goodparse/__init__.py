@@ -1,4 +1,4 @@
-"""Convert GoodNotes files into editable Xournal++ or Excalidraw documents.
+"""Convert GoodNotes files into editable Xournal++ or Excalidraw documents, or PDF.
 
 Public API::
 
@@ -7,6 +7,7 @@ Public API::
     doc = parse_goodnotes("notes.goodnotes")   # -> GoodNotesDocument
     convert_file("notes.goodnotes", "notes.xopp")
     convert_file("notes.goodnotes", "notes.excalidraw")  # format from extension
+    convert_file("notes.goodnotes", "notes.pdf")
 """
 
 from __future__ import annotations
@@ -15,6 +16,7 @@ import os
 
 from .excalidraw import build_scene, write_excalidraw
 from .goodnotes import GoodNotesDocument, Page, Stroke, parse_goodnotes
+from .pdf import build_pdf, write_pdf
 from .xournal import DEFAULT_WIDTH_SCALE, build_xml, write_xopp
 
 __all__ = [
@@ -26,14 +28,16 @@ __all__ = [
     "write_xopp",
     "build_scene",
     "write_excalidraw",
+    "build_pdf",
+    "write_pdf",
     "convert_file",
 ]
 
 __version__ = "0.1.0"
 
-FORMATS = ("xopp", "excalidraw")
+FORMATS = ("xopp", "excalidraw", "pdf")
 
-_WRITERS = {"xopp": write_xopp, "excalidraw": write_excalidraw}
+_WRITERS = {"xopp": write_xopp, "excalidraw": write_excalidraw, "pdf": write_pdf}
 
 
 def _infer_format(output_path: str | None, fmt: str | None) -> str:
@@ -53,7 +57,7 @@ def _infer_format(output_path: str | None, fmt: str | None) -> str:
 def convert_file(input_path: str, output_path: str | None = None,
                  width_scale: float = DEFAULT_WIDTH_SCALE,
                  fmt: str | None = None) -> str:
-    """Convert a ``.goodnotes`` file to ``.xopp`` or ``.excalidraw``.
+    """Convert a ``.goodnotes`` file to ``.xopp``, ``.excalidraw``, or ``.pdf``.
 
     The format is taken from ``fmt`` if given, otherwise inferred from the
     output extension (defaulting to xopp). Returns the output path.

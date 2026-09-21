@@ -3,6 +3,8 @@
 import gzip
 import json
 import os
+import re
+import zlib
 import xml.etree.ElementTree as ET
 
 import pytest
@@ -10,7 +12,8 @@ import pytest
 from goodparse import convert_file, parse_goodnotes
 from goodparse.applelz4 import apple_decompress, lz4_block_decompress
 from goodparse.excalidraw import color_to_rgb_hex
-from goodparse.goodnotes import extract_points
+from goodparse.goodnotes import GoodNotesDocument, Page, Stroke, extract_points
+from goodparse.pdf import build_pdf
 from goodparse.xournal import color_to_hex
 
 SAMPLES = os.path.join(os.path.dirname(__file__), os.pardir, "samples")
@@ -159,3 +162,140 @@ def test_convert_file_produces_valid_xopp(tmp_path):
         n_pts = len(s.text.split()) // 2
         n_widths = len(s.get("width").split())
         assert n_widths == n_pts
+
+
+# --------------------------------------------------------------------------- #
+# Integration: writing valid .pdf
+# --------------------------------------------------------------------------- #
+
+def _xref_offsets(data: bytes):
+    """Parse the xref table into {objnum: (offset, kind)}.
+
+    Returns (entries, size, startxref_value). Validates that `startxref`
+    points at `xref` and reads the single subsection that starts at object 0.
+    """
+    m = re.search(rb"startxref\s+(\d+)\s+%%EOF", data)
+    assert m, "missing startxref/%%EOF trailer"
+    startxref = int(m.group(1))
+    assert data[startxref:startxref + 4] == b"xref", "startxref does not point at xref"
+
+    lines = data[startxref:].split(b"\n")
+    assert lines[0] == b"xref", "xref table malformed"
+    first, size = lines[1].split(b" ")
+    assert first == b"0", f"first xref subsection must start at 0, got {first!r}"
+    size = int(size)
+
+    entries = {}
+    for i in range(size):
+        parts = lines[2 + i].split(b" ")
+        entries[i] = (int(parts[0]), parts[2].decode())
+    return entries, size, startxref
+
+
+def _objects(data: bytes):
+    """Map objnum -> raw object bytes ('N 0 obj ... endobj')."""
+    objs = {}
+    for m in re.finditer(rb"(\d+) 0 obj\n(.*?)\nendobj\n", data, re.S):
+        objs[int(m.group(1))] = m.group(2)
+    return objs
+
+
+def _stream(obj_body: bytes) -> bytes:
+    """Extract the raw (compressed) stream bytes between ``stream`` and
+    ``endstream`` keywords inside a content-stream object body."""
+    start = obj_body.index(b"stream\n") + len(b"stream\n")
+    end = obj_body.rindex(b"\nendstream")
+    return obj_body[start:end]
+
+
+def test_pdf_synthetic_structure_and_yflip(tmp_path):
+    doc = GoodNotesDocument(pages=[
+        Page(width=100.0, height=50.0, strokes=[
+            Stroke(points=[(10.0, 20.0, 1.0), (20.0, 30.0, 2.0)],
+                   color=(1.0, 0.0, 0.0, 1.0)),
+        ]),
+        Page(width=100.0, height=50.0, strokes=[
+            Stroke(points=[(5.0, 5.0, 1.0), (6.0, 6.0, 1.0), (7.0, 7.0, 1.0)],
+                   color=(0.0, 1.0, 0.0, 0.5)),
+        ]),
+    ])
+    data = build_pdf(doc, width_scale=1.0)
+    out = tmp_path / "out.pdf"
+    out.write_bytes(data)
+
+    # --- trailer / xref self-consistency -----------------------------------
+    assert data.startswith(b"%PDF-1.4"), "missing PDF header"
+    assert data.rstrip().endswith(b"%%EOF"), "missing %%EOF"
+    entries, size, _ = _xref_offsets(data)
+    objs = _objects(data)
+    assert size == 1 + len(objs), "xref size != object count"
+    for num in range(1, size):
+        off, kind = entries[num]
+        assert kind == "n", f"obj {num} not an in-use entry"
+        assert data[off:].startswith(f"{num} 0 obj".encode()), \
+            f"xref offset for obj {num} is wrong"
+        assert num in objs, f"obj {num} present in xref but not in file"
+
+    # --- page count / kids --------------------------------------------------
+    pages = _objects(data)[2]
+    assert b"/Count 2" in pages and b"/Kids [" in pages
+
+    # --- per-page MediaBox --------------------------------------------------
+    p1 = _objects(data)[3]
+    assert b"/MediaBox [0 0 100 50]" in p1, "page 1 MediaBox wrong"
+
+    # --- content streams: Y-flip + colour ----------------------------------
+    c1 = zlib.decompress(_stream(_objects(data)[4]))
+    # red stroke, opaque -> no ExtGState
+    assert b"1 0 0 RG" in c1
+    # first point (10,20) on a 50pt-tall page -> y flipped to 30
+    assert b"10 30 m" in c1
+    # second point (20,30) -> y flipped to 20
+    assert b"20 20 l" in c1
+    # segment width = mean(1,2) = 1.5
+    assert b"1.5 w" in c1
+    # round caps/joins set
+    assert b"J 1" in c1 and b"j 1" in c1
+
+    # --- ExtGState for the semi-transparent green stroke -------------------
+    # page 2 content is obj 6; its resources must reference GS0
+    p2 = _objects(data)[5]
+    assert b"/ExtGState" in p2
+    c2 = zlib.decompress(_stream(_objects(data)[6]))
+    assert b"0 1 0 RG" in c2
+    assert b"/GS0 gs" in c2
+    # the ExtGState object (obj 7) sets ca/CA to 0.5
+    assert b"/ca 0.5 /CA 0.5" in _objects(data)[7]
+
+
+def test_pdf_real_sample(tmp_path):
+    out = convert_file(sample("Test4.goodnotes"), str(tmp_path / "out.pdf"))
+    data = open(out, "rb").read()
+    assert data.startswith(b"%PDF-1.4")
+    assert data.rstrip().endswith(b"%%EOF")
+
+    # xref offsets are self-consistent
+    entries, size, _ = _xref_offsets(data)
+    objs = _objects(data)
+    assert size == 1 + len(objs)
+    for num in range(1, size):
+        off, kind = entries[num]
+        assert kind == "n"
+        assert data[off:].startswith(f"{num} 0 obj".encode())
+
+    # single A4 page
+    pages = _objects(data)[2]
+    assert b"/Count 1" in pages
+    assert b"/MediaBox [0 0 595.28 841.89]" in _objects(data)[3]
+
+    # all five stroke colours present in the (decompressed) content stream
+    c = zlib.decompress(_stream(_objects(data)[4])).decode()
+    expected = {  # #d20000 #007aff #f59a23 #007355 #ff9797 -> RGB floats
+        "0.8235 0 0 RG",   # d2
+        "0 0.4784 1 RG",   # 007aff
+        "0.9608 0.6039 0.1373 RG",  # f59a23
+        "0 0.451 0.3333 RG",        # 007355
+        "1 0.5922 0.5922 RG",       # ff9797
+    }
+    for frag in expected:
+        assert frag in c, f"missing colour {frag!r} in PDF content"
