@@ -1,4 +1,4 @@
-"""Command-line entry point: ``goodnotes2xournal INPUT [-o OUTPUT]``."""
+"""Command-line entry point: ``goodparse INPUT [-o OUTPUT]``."""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ from .xournal import DEFAULT_WIDTH_SCALE
 
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(
-        prog="goodnotes2xournal",
+        prog="goodparse",
         description="Convert GoodNotes (.goodnotes) files to "
                     "Xournal++ (.xopp) or Excalidraw (.excalidraw).",
     )

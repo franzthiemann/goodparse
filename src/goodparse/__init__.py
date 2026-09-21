@@ -2,7 +2,7 @@
 
 Public API::
 
-    from goodnotes2xournal import convert_file, parse_goodnotes
+    from goodparse import convert_file, parse_goodnotes
 
     doc = parse_goodnotes("notes.goodnotes")   # -> GoodNotesDocument
     convert_file("notes.goodnotes", "notes.xopp")

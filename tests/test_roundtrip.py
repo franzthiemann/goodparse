@@ -7,11 +7,11 @@ import xml.etree.ElementTree as ET
 
 import pytest
 
-from goodnotes2xournal import convert_file, parse_goodnotes
-from goodnotes2xournal.applelz4 import apple_decompress, lz4_block_decompress
-from goodnotes2xournal.excalidraw import color_to_rgb_hex
-from goodnotes2xournal.goodnotes import extract_points
-from goodnotes2xournal.xournal import color_to_hex
+from goodparse import convert_file, parse_goodnotes
+from goodparse.applelz4 import apple_decompress, lz4_block_decompress
+from goodparse.excalidraw import color_to_rgb_hex
+from goodparse.goodnotes import extract_points
+from goodparse.xournal import color_to_hex
 
 SAMPLES = os.path.join(os.path.dirname(__file__), os.pardir, "samples")
 

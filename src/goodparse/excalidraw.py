@@ -25,7 +25,7 @@ from typing import List, Tuple
 
 from .goodnotes import GoodNotesDocument, Stroke
 
-SCENE_SOURCE = "goodnotes2xournal"
+SCENE_SOURCE = "goodparse"
 
 # Vertical gap between consecutive pages on the canvas, in points/pixels.
 PAGE_GAP = 40.0

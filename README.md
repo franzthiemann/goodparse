@@ -1,4 +1,4 @@
-# goodnotes2xournal
+# goodparse
 
 Convert **GoodNotes** (`.goodnotes`) files into editable **Xournal++** (`.xopp`)
 or **Excalidraw** (`.excalidraw`) documents, preserving strokes (geometry,
@@ -17,17 +17,17 @@ pip install -e .
 ### CLI
 
 ```bash
-goodnotes2xournal notes.goodnotes                    # -> notes.xopp
-goodnotes2xournal notes.goodnotes -o out.xopp        # explicit output
-goodnotes2xournal notes.goodnotes -o out.excalidraw  # format from extension
-goodnotes2xournal notes.goodnotes -f excalidraw      # -> notes.excalidraw
-goodnotes2xournal notes.goodnotes -w 1.5 -v          # 1.5x stroke widths, verbose
+goodparse notes.goodnotes                    # -> notes.xopp
+goodparse notes.goodnotes -o out.xopp        # explicit output
+goodparse notes.goodnotes -o out.excalidraw  # format from extension
+goodparse notes.goodnotes -f excalidraw      # -> notes.excalidraw
+goodparse notes.goodnotes -w 1.5 -v          # 1.5x stroke widths, verbose
 ```
 
 ### Library
 
 ```python
-from goodnotes2xournal import parse_goodnotes, convert_file
+from goodparse import parse_goodnotes, convert_file
 
 doc = parse_goodnotes("notes.goodnotes")
 for page in doc.pages:
@@ -66,7 +66,7 @@ Key details discovered from the sample files:
 
 - The compression is Apple's framed LZ4: `bv41` + uint32 decompressed size +
   uint32 compressed size + an LZ4 *block*, terminated by `bv4$`. Implemented from
-  scratch in [`applelz4.py`](src/goodnotes2xournal/applelz4.py).
+  scratch in [`applelz4.py`](src/goodparse/applelz4.py).
 - The decompressed buffer starts with `tpl\0` + length, a constant 40-byte style
   template, a small count header, then the point array, then a trailer. The
   rendered path is the **first** run of valid triplets at offset ≥ 64; later runs

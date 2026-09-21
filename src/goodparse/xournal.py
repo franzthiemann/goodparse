@@ -17,7 +17,7 @@ from xml.sax.saxutils import escape
 
 from .goodnotes import GoodNotesDocument, Stroke
 
-CREATOR = "goodnotes2xournal"
+CREATOR = "goodparse"
 FILE_VERSION = "4"
 
 # Multiplier applied to GoodNotes' rendered per-point widths. GoodNotes already
