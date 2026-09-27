@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import re
 import zlib
+from types import SimpleNamespace
 from typing import Dict, List, Optional, Tuple
 
 from .goodnotes import GoodNotesDocument, Stroke, TextBox
@@ -84,6 +85,44 @@ def _text_font_size(t: TextBox) -> float:
     return max(8.0, t.size[1] / (1.2 * nlines))
 
 
+# Helvetica glyph advance widths (Adobe WinAnsi), in thousandths of an em.  Used
+# only to place underlines/strikethroughs under styled runs; a 0 entry means
+# "use the space width".
+_HELVETICA_ADV = {
+    0x20: 278, 0x21: 278, 0x22: 355, 0x23: 556, 0x24: 556, 0x25: 889,
+    0x26: 667, 0x27: 191, 0x28: 333, 0x29: 333, 0x2a: 389, 0x2b: 584,
+    0x2c: 278, 0x2d: 333, 0x2e: 278, 0x2f: 278, 0x30: 556, 0x31: 556,
+    0x32: 556, 0x33: 556, 0x34: 556, 0x35: 556, 0x36: 556, 0x37: 556,
+    0x38: 556, 0x39: 556, 0x3a: 278, 0x3b: 278, 0x3c: 584, 0x3d: 584,
+    0x3e: 584, 0x3f: 389, 0x40: 1015, 0x5b: 278, 0x5c: 278, 0x5d: 278,
+    0x5e: 469, 0x5f: 556, 0x60: 333, 0x7b: 278, 0x7c: 260, 0x7d: 278,
+    0x7e: 584,
+}
+for _c in range(0x41, 0x5B):  # A-Z
+    _HELVETICA_ADV[_c] = 667
+for _c in range(0x61, 0x7B):  # a-z
+    _HELVETICA_ADV[_c] = 556
+# a few real exceptions in the base-1000 Helvetica metrics
+for _c, _w in [(0x44, 722), (0x57, 944), (0x46, 611), (0x54, 611),
+               (0x56, 667), (0x59, 667), (0x67, 556), (0x6c, 278),
+               (0x69, 278), (0x6a, 278), (0x66, 333), (0x75, 556),
+               (0x2e, 278), (0x2c, 278)]:
+    _HELVETICA_ADV[_c] = _w
+
+
+def _run_width(text: str, fs: float) -> float:
+    """Approximate advance width of ``text`` in PDF points at font size ``fs``."""
+    total = 0.0
+    for ch in text:
+        total += _HELVETICA_ADV.get(ord(ch), 556)
+    return total / 1000.0 * fs
+
+
+def _font_name(bold: bool, italic: bool,
+               font_map: Dict[Tuple[bool, bool], str]) -> str:
+    return "/" + font_map.get((bold, italic), "F1")
+
+
 def _raster_to_jpeg(data: bytes) -> Optional[Tuple[int, int, bytes]]:
     """Decode an embedded raster (PNG/JPEG) and re-encode it as RGB JPEG."""
     if _PILImage is None or not data:
@@ -125,23 +164,90 @@ def _image_obj(w: int, h: int, jpg: bytes) -> bytes:
             + jpg + b"\nendstream")
 
 
-def _emit_text(parts: List[str], t: TextBox, s: float, h: float) -> None:
-    """Append Helvetica ``Tj`` ops for a text box (top-left origin -> PDF)."""
-    r, g, b, _a = t.color
+def _emit_text(parts: List[str], t: TextBox, s: float, h: float,
+               font_map: Dict[Tuple[bool, bool], str]) -> None:
+    """Append ``Tj``/line ops for a text box (top-left origin -> PDF).
+
+    Each styled run is emitted with its own font (``/F1``.. = plain,
+    bold, italic, bold-italic); underlines and strikethroughs are thin vector
+    lines positioned under/through the run using the Helvetica advance widths.
+    Runs are reflowed word-by-word so they wrap to the box width (matching the
+    reference, which wraps a long line) instead of overflowing the page.
+    """
     fs = _text_font_size(t) * s
-    x = t.position[0] * s
+    x0 = t.position[0] * s
     top = t.position[1] * s
+    box_w = max(fs * 0.5, t.size[0] * s)
     leading = fs * 1.2
-    parts.append(f"{_num(r)} {_num(g)} {_num(b)} rg")
-    parts.append(f"/F1 {fs:.2f} Tf")
-    for j, line in enumerate(t.plain.split("\n")):
+
+    lines = t.lines if t.lines else [SimpleNamespace(
+        runs=[SimpleNamespace(text=t.plain, bold=False, italic=False,
+                              underline=False, strike=False, color=t.color)])]
+
+    # Flatten every run into (word, run-attrs) tokens, splitting on spaces so
+    # we can wrap mid-run; spaces rejoin the following word.
+    tokens = []
+    for line in lines:
+        for run in line.runs:
+            if not run.text:
+                continue
+            words = run.text.split(" ")
+            for wi, w in enumerate(words):
+                if not w:
+                    continue
+                tokens.append(SimpleNamespace(
+                    text=w, bold=run.bold, italic=run.italic,
+                    underline=run.underline, strike=run.strike,
+                    color=run.color))
+
+    # Greedy word wrap across visual lines.
+    vlines: List[List] = [[]]
+    used = 0.0
+    for tok in tokens:
+        w = _run_width(tok.text, fs)
+        space = _run_width(" ", fs)
+        add = w + (space if vlines[-1] else 0.0)
+        if vlines[-1] and used + add > box_w and used > 0:
+            vlines.append([tok])
+            used = w
+        else:
+            vlines[-1].append(tok)
+            used += add
+
+    for j, vline in enumerate(vlines):
+        if not vline:
+            continue
         baseline = h - (top + fs * 0.8 + j * leading)
-        parts.append(
-            f"BT {x:.2f} {baseline:.2f} Td ({_pdf_escape(line)}) Tj ET")
+        cursor = x0
+        for k, tok in enumerate(vline):
+            r, g, b, _a = tok.color
+            fname = _font_name(bool(tok.bold), bool(tok.italic), font_map)
+            seg = tok.text
+            if k < len(vline) - 1:
+                seg += " "
+            parts.append(f"{_num(r)} {_num(g)} {_num(b)} rg")
+            parts.append(f"{fname} {fs:.2f} Tf")
+            parts.append(
+                f"BT {cursor:.2f} {baseline:.2f} Td ({_pdf_escape(seg)}) Tj ET")
+            w = _run_width(seg, fs)
+            if tok.underline:
+                uy = h - (top + (j + 1) * leading * 0.94)
+                parts.append(f"{_num(r)} {_num(g)} {_num(b)} RG")
+                parts.append(f"{max(0.5, fs * 0.05):.2f} w "
+                             f"{cursor:.2f} {uy:.2f} m "
+                             f"{cursor + w:.2f} {uy:.2f} l S")
+            if tok.strike:
+                sy = h - (top + (j + 1) * leading * 0.5)
+                parts.append(f"{_num(r)} {_num(g)} {_num(b)} RG")
+                parts.append(f"{max(0.5, fs * 0.05):.2f} w "
+                             f"{cursor:.2f} {sy:.2f} m "
+                             f"{cursor + w:.2f} {sy:.2f} l S")
+            cursor += w
 
 
 def _page_content(page, width_scale: float, alpha_name: Dict[float, str],
-                  has_font: bool, next_num: int) -> Tuple[str,
+                  has_font: bool, next_num: int,
+                  font_map: Dict[Tuple[bool, bool], str]) -> Tuple[str,
                                                           List[str],
                                                           Dict[int, bytes]]:
     """Build a page's content stream plus its image XObject objects.
@@ -211,7 +317,7 @@ def _page_content(page, width_scale: float, alpha_name: Dict[float, str],
     # --- text --------------------------------------------------------------- #
     if has_font:
         for t in page.texts:
-            _emit_text(out, t, s, h)
+            _emit_text(out, t, s, h, font_map)
 
     return "\n".join(out) + "\n", xrefs, img_bodies
 
@@ -238,11 +344,25 @@ def build_pdf(doc: GoodNotesDocument, width_scale: float = 1.0) -> bytes:
     content_obj = lambda i: 4 + 2 * i       # 4, 6, 8, ...
     ext_first = 3 + 2 * n_pages
     extg_obj = lambda j: ext_first + j      # one per unique alpha
-    # Number the remaining objects without gaps: font (if text) then images.
+    # Number the remaining objects without gaps: fonts (if text) then images.
+    # /F1..Fn = Helvetica plain / bold / italic / bold-italic; only the
+    # variants actually referenced by a styled run get an object.
+    font_map: Dict[Tuple[bool, bool], str] = {}
     next_free = ext_first + len(alphas)
     font_obj = next_free
     if has_font:
-        next_free += 1
+        used = set()
+        for page in pages:
+            for t in page.texts:
+                runs = [r for ln in (t.lines or []) for r in ln.runs]
+                if not runs:
+                    runs = [SimpleNamespace(bold=False, italic=False, text="")]
+                for r in runs:
+                    used.add((bool(r.bold), bool(r.italic)))
+        for fi, (bold, italic) in enumerate(
+                sorted(used, key=lambda b: (b[0], b[1]))):
+            font_map[(bold, italic)] = f"F{fi + 1}"
+        next_free += len(font_map)
     img_base = next_free                     # image objects numbered from here
 
     bodies: Dict[int, bytes] = {
@@ -252,13 +372,19 @@ def build_pdf(doc: GoodNotesDocument, width_scale: float = 1.0) -> bytes:
     for j, a in enumerate(alphas):
         bodies[extg_obj(j)] = f"<< /ca {_num(a)} /CA {_num(a)} >>".encode()
     if has_font:
-        bodies[font_obj] = (b"<< /Type /Font /Subtype /Type1 "
-                            b"/BaseFont /Helvetica /Encoding /WinAnsiEncoding >>")
+        _base = {(False, False): "/Helvetica", (True, False): "/Helvetica-Bold",
+                 (False, True): "/Helvetica-Oblique",
+                 (True, True): "/Helvetica-BoldOblique"}
+        for fi, ((bold, italic), fname) in enumerate(font_map.items()):
+            bodies[font_obj + fi] = (
+                b"<< /Type /Font /Subtype /Type1 /BaseFont "
+                + _base[(bold, italic)].encode()
+                + b" /Encoding /WinAnsiEncoding >>")
 
     img_counter = img_base
     for i, page in enumerate(pages):
         content, xrefs, img_bodies = _page_content(
-            page, width_scale, alpha_name, has_font, img_counter)
+            page, width_scale, alpha_name, has_font, img_counter, font_map)
         img_counter += len(img_bodies)
         for num, payload in img_bodies.items():
             bodies[num] = payload
@@ -273,7 +399,10 @@ def build_pdf(doc: GoodNotesDocument, width_scale: float = 1.0) -> bytes:
         if xrefs:
             res_parts.append("/XObject << " + " ".join(xrefs) + " >>")
         if has_font:
-            res_parts.append(f"/Font << /F1 {font_obj} 0 R >>")
+            font_refs = " ".join(
+                f"/{fname} {font_obj + fi} 0 R"
+                for fi, ((bold, italic), fname) in enumerate(font_map.items()))
+            res_parts.append(f"/Font << {font_refs} >>")
         if alphas:
             res_parts.append("/ExtGState << " +
                              " ".join(f"/GS{j} {extg_obj(j)} 0 R"

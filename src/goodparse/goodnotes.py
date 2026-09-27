@@ -47,6 +47,7 @@ from .protobuf import (
     parse_message,
     read_length_delimited_records,
 )
+from .text_rtf import TextLine, parse_rtf_runs
 
 # A4 in PDF points (72 dpi) — fallback for documents without an explicit page
 # size (samples 1-4 are A4).
@@ -116,13 +117,19 @@ class Image:
 
 @dataclass
 class TextBox:
-    """One text box with RTF content."""
+    """One text box with RTF content.
+
+    ``lines`` holds the styled run breakdown (per-line, per-run bold/italic/
+    underline/strike/colour) parsed from the RTF; exporters use it to render
+    formatting, while ``plain``/``rtf`` are kept for simple consumers.
+    """
 
     position: Tuple[float, float]  # top-left, canvas space
     size: Tuple[float, float]      # (w, h), canvas space
     rtf: str
     plain: str
     color: Tuple[float, float, float, float] = (0.0, 0.0, 0.0, 1.0)
+    lines: List["TextLine"] = field(default_factory=list)
 
 
 @dataclass
@@ -292,6 +299,33 @@ def extract_curve(raw: bytes) -> List[Tuple[float, float]]:
     if (max(xs) - min(xs)) < 0.5 and (max(ys) - min(ys)) < 0.5:
         return []  # degenerate (all-zero placeholder)
     return pts
+
+
+def _stroke_origin(content_fields) -> Optional[Tuple[float, float]]:
+    """Read the stroke's origin/anchor offset from field ``#6``.
+
+    Some strokes (the grouped marker strokes, tagged with a layer UUID in
+    field ``#10``) store their points relative to a per-stroke origin instead
+    of the canvas.  Field ``#6`` is a small nested message holding that origin
+    as float32 sub-fields ``1 = x`` and ``2 = y``.  It is the translation that
+    maps the stored (relative) frame back to canvas space, so it is *added* to
+    every stored point.  Strokes without a ``#6`` message — including all
+    primary (stride-12) strokes and the small flag-run strokes — carry no
+    offset and decode in canvas coordinates directly.
+    """
+    blobs = content_fields.get(6)
+    if not blobs:
+        return None
+    if not isinstance(blobs[0], (bytes, bytearray)):
+        return None
+    try:
+        vals = {fno: val for fno, _wt, val in iter_fields(blobs[0])}
+    except (ValueError, struct.error):
+        return None
+    x, y = vals.get(1), vals.get(2)
+    if isinstance(x, float) and isinstance(y, float):
+        return x, y
+    return None
 
 
 def _extract_color(content_fields) -> Tuple[float, float, float, float]:
@@ -470,6 +504,11 @@ def _parse_stroke(cf) -> Optional[Stroke]:
     # flag-run encoding stores no per-point width; give it a default pen width
     if all(w == 0.0 for _x, _y, w in pts):
         pts = [(x, y, _PEN_DEFAULT_WIDTH_PT) for x, y, _w in pts]
+    # Grouped strokes store their points relative to a per-stroke origin held
+    # in field #6 (a nested {1: x, 2: y} float32 message); add it back.
+    origin = _stroke_origin(cf)
+    if origin is not None:
+        pts = [(x + origin[0], y + origin[1], w) for x, y, w in pts]
     # f10 (a second UUID) marks strokes on a shared layer/group — it is NOT an
     # eraser flag; the stroke keeps its own stored colour.
     return Stroke(points=pts, color=color, kind="pen")
@@ -533,10 +572,18 @@ def parse_page(data: bytes, attachments: Dict[str, bytes],
                 # the black default.
                 color = (0.0, 0.0, 0.0, 1.0)
                 if rtf is not None:
+                    lines = parse_rtf_runs(bytes(rtf))
+                    plain = "\n".join(ln.text().strip()
+                                      for ln in lines if ln.text().strip())
+                    # prefer the colour the RTF itself selects (default black)
+                    for ln in lines:
+                        if ln.runs:
+                            color = ln.runs[0].color
+                            break
                     page.texts.append(TextBox(
                         position=top_left, size=size_vec,
                         rtf=bytes(rtf).decode("cp1252", "replace"),
-                        plain=_rtf_to_plain(bytes(rtf)), color=color,
+                        plain=plain, color=color, lines=lines,
                     ))
 
     # second pass: match images to their companion matrix records
