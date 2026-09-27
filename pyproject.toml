@@ -15,7 +15,15 @@ classifiers = [
     "Programming Language :: Python :: 3",
     "Topic :: Utilities",
 ]
-dependencies = []
+dependencies = [
+    # Full-fidelity PDF export (backgrounds + embedded photos + text) needs
+    # Pillow to encode JPEGs and pypdfium2 to rasterise the vector background
+    # paper PDFs.  The stroke-only converter still works if either is absent
+    # (they are imported optionally in goodparse.pdf), but a normal install
+    # gets both for the complete output.
+    "Pillow>=10.0",
+    "pypdfium2>=4.30",
+]
 
 [project.scripts]
 goodparse = "goodparse.cli:main"

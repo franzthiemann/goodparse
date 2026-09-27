@@ -108,7 +108,8 @@ def test_convert_file_produces_valid_excalidraw(tmp_path):
     strokes = [e for e in scene["elements"] if e["type"] == "freedraw"]
     frames = [e for e in scene["elements"] if e["type"] == "rectangle"]
     assert len(strokes) == 5
-    assert len(frames) == 1 and frames[0]["locked"]
+    # Test4 has two pages (one empty) -> one locked frame rectangle per page.
+    assert len(frames) == 2 and all(f["locked"] for f in frames)
 
     expected = {"#d20000", "#007aff", "#f59a23", "#007355", "#ff9797"}
     assert {s["strokeColor"] for s in strokes} == expected
@@ -283,13 +284,15 @@ def test_pdf_real_sample(tmp_path):
         assert kind == "n"
         assert data[off:].startswith(f"{num} 0 obj".encode())
 
-    # single A4 page
+    # Test4 has two pages (one empty, one with the five strokes), matching the
+    # reference Test4.pdf; each is 455.04 x 588.45 pt (from its background PDF).
     pages = _objects(data)[2]
-    assert b"/Count 1" in pages
-    assert b"/MediaBox [0 0 595.28 841.89]" in _objects(data)[3]
+    assert b"/Count 2" in pages
+    assert b"/MediaBox [0 0 455.04 588.45]" in _objects(data)[3]
 
-    # all five stroke colours present in the (decompressed) content stream
-    c = zlib.decompress(_stream(_objects(data)[4])).decode()
+    # all five stroke colours present in the (decompressed) content stream of
+    # the second page (obj 6: catalog, pages, then [page,content] per page)
+    c = zlib.decompress(_stream(_objects(data)[6])).decode()
     expected = {  # #d20000 #007aff #f59a23 #007355 #ff9797 -> RGB floats
         "0.8235 0 0 RG",   # d2
         "0 0.4784 1 RG",   # 007aff
@@ -299,3 +302,114 @@ def test_pdf_real_sample(tmp_path):
     }
     for frag in expected:
         assert frag in c, f"missing colour {frag!r} in PDF content"
+
+
+# --------------------------------------------------------------------------- #
+# Sample 5: full-fidelity features (3 pages, backgrounds, image, text)
+# --------------------------------------------------------------------------- #
+
+def test_test5_three_pages_in_order():
+    # The reference has three pages: a background-only page, a doodle page, and
+    # a photo/text page.  All three must appear, in that order.
+    doc = parse_goodnotes(sample("Test5.goodnotes"))
+    assert len(doc.pages) == 3
+    p0, p1, p2 = doc.pages
+    # first page is empty (background only) but is kept
+    assert not p0.strokes and not p0.images and not p0.texts
+    assert p0.background
+    # doodle page: strokes, no image
+    assert p1.strokes and not p1.images
+    # photo/text page
+    assert p2.images and p2.texts
+    # page size comes from the embedded paper PDF (not A4)
+    assert p0.width == pytest.approx(455.04, abs=0.1)
+    assert p0.height == pytest.approx(588.45, abs=0.1)
+
+
+def test_test5_backgrounds_map_to_pages():
+    # Page 1 uses the cyan paper; the doodle + photo pages use the graph paper.
+    # We identify a paper by rendering-free proxy: the two background attachments
+    # are distinct, and page 1 differs from the others.
+    doc = parse_goodnotes(sample("Test5.goodnotes"))
+    p0, p1, p2 = doc.pages
+    assert p0.background and p1.background and p2.background
+    assert p0.background != p1.background      # cyan != graph
+    assert p1.background == p2.background       # graph == graph
+
+
+def test_test5_text_parsed_black_and_plain():
+    doc = parse_goodnotes(sample("Test5.goodnotes"))
+    texts = [t for p in doc.pages for t in p.texts]
+    assert len(texts) == 2
+    plains = sorted(t.plain for t in texts)
+    assert "Hallo" in plains
+    assert any("Test" in p and "123" in p for p in plains)
+    # text colour is black (the box's 15-byte fields are geometry, not colour)
+    assert all(t.color == (0.0, 0.0, 0.0, 1.0) for t in texts)
+
+
+def test_test5_xopp_has_image_and_text(tmp_path):
+    out = convert_file(sample("Test5.goodnotes"), str(tmp_path / "out.xopp"))
+    with gzip.open(out, "rb") as fh:
+        root = ET.fromstring(fh.read())
+    pages = root.findall("page")
+    assert len(pages) == 3
+    rich = [p for p in pages if p.findall(".//image")]
+    assert len(rich) == 1
+    img = rich[0].find(".//image")
+    # base64 body is the re-encoded raster (large), with a naturalSize hint
+    assert len(img.text or "") > 1000
+    assert img.get("naturalSize")
+    # the photo lands inside the page box
+    w, h = float(pages[0].get("width")), float(pages[0].get("height"))
+    assert 0 < float(img.get("left")) < w
+    assert 0 < float(img.get("top")) < h
+    # two text boxes on the same page
+    assert len(rich[0].findall(".//text")) == 2
+
+
+def test_test5_pdf_full_fidelity(tmp_path):
+    out = convert_file(sample("Test5.goodnotes"), str(tmp_path / "out.pdf"))
+    data = open(out, "rb").read()
+    assert data.startswith(b"%PDF-1.4")
+    assert data.rstrip().endswith(b"%%EOF")
+
+    entries, size, _ = _xref_offsets(data)
+    objs = _objects(data)
+    assert size == 1 + len(objs)
+    for num in range(1, size):
+        off, kind = entries[num]
+        assert kind == "n"
+        assert data[off:].startswith(f"{num} 0 obj".encode())
+
+    pages = _objects(data)[2]
+    assert b"/Count 3" in pages
+
+    # the empty first page still carries its background as an image XObject
+    page0 = _objects(data)[3]
+    assert b"/ImBg" in page0
+
+    # the photo page carries the train photo + a font + text
+    page2 = _objects(data)[7]
+    assert b"/Im" in page2          # embedded photo XObject
+    assert b"/F1" in page2          # Helvetica text font
+    assert b"/Helvetica" in data
+
+
+def test_pdf_stroke_only_still_valid_without_raster(tmp_path, monkeypatch):
+    # Even if the optional raster deps are unavailable, a valid stroke-only PDF
+    # is produced (no backgrounds / photos / text), and the xref stays sound.
+    import goodparse.pdf as pdf_mod
+    monkeypatch.setattr(pdf_mod, "_pdfium", None)
+    monkeypatch.setattr(pdf_mod, "_PILImage", None)
+    out = convert_file(sample("Test5.goodnotes"), str(tmp_path / "out.pdf"))
+    data = open(out, "rb").read()
+    assert data.startswith(b"%PDF-1.4")
+    assert data.rstrip().endswith(b"%%EOF")
+    entries, size, _ = _xref_offsets(data)
+    assert size == 1 + len(_objects(data))
+    # no image XObjects / backgrounds without the raster deps (text is stdlib
+    # and still appears)
+    assert b"/DCTDecode" not in data
+    assert b"/ImBg" not in data
+    assert b"/F1" in data              # text font still present
