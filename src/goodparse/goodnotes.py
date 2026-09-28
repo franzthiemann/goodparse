@@ -77,6 +77,14 @@ _HL_DEFAULT_WIDTH_PT = 10.0
 # read as proper bands.
 _PEN_DEFAULT_WIDTH_PT = 20.0
 
+# Marker strokes store a *uniform* width as a single float32 at byte 40 of the
+# decompressed geometry blob (after the "tpl\0"+length+style-template header).
+# A pen stroke has no such header (its bytes 40-43 are part of the template and
+# read as a huge, implausible float), so a sane range identifies a marker.
+_MARKER_WIDTH_OFFSET = 40
+_MARKER_WIDTH_MIN = 0.5
+_MARKER_WIDTH_MAX = 500.0
+
 
 @dataclass
 class Stroke:
@@ -547,7 +555,25 @@ def _rtf_to_plain(rtf: bytes) -> str:
 # Page / archive parsing
 # --------------------------------------------------------------------------- #
 
-def _parse_stroke(cf) -> Optional[Stroke]:
+def _marker_width(raw: bytes) -> Optional[float]:
+    """Return the marker's uniform width (canvas units) if the buffer holds a
+    marker width float at byte 40, else ``None``.
+
+    Marker strokes (and the flag-run/stride-8 layouts) carry one uniform width
+    as a float32 at offset 40 of the decompressed blob, right after the
+    "tpl\\0"+length+style-template header.  Pen strokes have no such header —
+    bytes 40-43 there are template data that decode to a huge, implausible
+    float — so a sane range (0.5..500 canvas units) identifies a marker.
+    """
+    if len(raw) < _MARKER_WIDTH_OFFSET + 4:
+        return None
+    w = _f32(raw, _MARKER_WIDTH_OFFSET)
+    if _MARKER_WIDTH_MIN <= w <= _MARKER_WIDTH_MAX:
+        return w
+    return None
+
+
+def _parse_stroke(cf, scale: float = 1.0) -> Optional[Stroke]:
     """Build a Stroke from a field ``#7`` content message."""
     blob = _find_geometry_blob(cf)
     if blob is None:
@@ -567,9 +593,19 @@ def _parse_stroke(cf) -> Optional[Stroke]:
     pts = extract_points(raw)
     if not pts:
         return None
-    # flag-run encoding stores no per-point width; give it a default pen width
+    # flag-run / stride-8 strokes store no per-point width.  If the buffer
+    # carries a marker width float (offset 40) use it — GoodNotes markers have
+    # a single uniform width; otherwise fall back to the default pen width.
     if all(w == 0.0 for _x, _y, w in pts):
-        pts = [(x, y, _PEN_DEFAULT_WIDTH_PT) for x, y, _w in pts]
+        mw = _marker_width(raw)
+        if mw is not None and scale > 0:
+            # offset-40 value × 0.25 = rendered page-pt (calibrated against
+            # Test7's three known marker lines); store canvas units so the PDF
+            # emitter's ×scale yields the right page thickness.
+            w_canvas = mw * 0.25 / scale
+        else:
+            w_canvas = _PEN_DEFAULT_WIDTH_PT
+        pts = [(x, y, w_canvas) for x, y, _w in pts]
     # Grouped strokes store their points relative to a per-stroke origin held
     # in field #6 (a nested {1: x, 2: y} float32 message); add it back.
     origin = _stroke_origin(cf)
@@ -602,7 +638,7 @@ def parse_page(data: bytes, attachments: Dict[str, bytes],
             if not isinstance(content, (bytes, bytearray)):
                 continue
             cf = parse_message(content)
-            stroke = _parse_stroke(cf)
+            stroke = _parse_stroke(cf, scale=page.scale)
             if stroke:
                 page.strokes.append(stroke)
         # images: top-level record with #4 = attachment UUID (no #7)
