@@ -70,11 +70,12 @@ _HL_FLAG_RUN_MIN = 20
 # Highlighter / eraser strokes have no per-point width; use a default.
 _HL_DEFAULT_WIDTH_PT = 10.0
 
-# The flag-run pen encoding also omits per-point width; default to a normal
-# ballpoint width (canvas points).  The reference draws these widthless strokes
-# on the thin side (~1-2 pt), so we pick a mid-range value rather than a heavy
-# marker width.
-_PEN_DEFAULT_WIDTH_PT = 2.0
+# Widthless marker/pen strokes (flag-run and stride-8 encodings store no
+# per-point width).  The reference draws these as thick marker swipes (~20 pt
+# page = ~36 canvas); the default is a mid-weight canvas value that keeps the
+# thin widthless black marks from bloating while making the colored markers
+# read as proper bands.
+_PEN_DEFAULT_WIDTH_PT = 20.0
 
 
 @dataclass
@@ -223,19 +224,58 @@ def _points_after_flag(raw: bytes) -> List[Tuple[float, float, float]]:
     return pts
 
 
-def extract_points(raw: bytes) -> List[Tuple[float, float, float]]:
-    """Extract the stroke path from decompressed pen geometry.
+def _longest_run(raw: bytes, stride: int, xoff: int, yoff: int,
+                 woff: int = -1) -> Tuple[int, int]:
+    """Return the ``(start, count)`` of the longest contiguous run of valid
+    coordinate samples at ``stride`` bytes, reading ``(x, y[, w])`` at the given
+    offsets.  ``woff`` -1 means no width is stored (stride‑8 / stride‑20)."""
+    n = len(raw)
 
-    Each point is a float32 ``(x, y, width)`` triplet at stride 12, *unless* the
-    buffer uses the flag-run encoding (a long 0x00/0x01 run), in which case the
-    path is ``[x0][y0][u32 count]`` followed by ``count`` stride-8 ``(x, y)``
-    pairs.  For the primary layout we take the earliest run of >= 2 valid
-    triplets at offset >= 64.
+    def valid(o: int) -> bool:
+        if o + stride > n:
+            return False
+        x, y = _f32(raw, o + xoff), _f32(raw, o + yoff)
+        if not (_COORD_MIN < x < _COORD_MAX and _COORD_MIN < y < _COORD_MAX):
+            return False
+        if woff >= 0 and not (0.0 <= _f32(raw, o + woff) <= _WIDTH_MAX):
+            return False
+        return True
+
+    best_start, best_count, s = 0, 0, 0
+    while s + stride <= n:
+        if valid(s):
+            e = s
+            while valid(e):
+                e += stride
+            c = (e - s) // stride
+            if c > best_count:
+                best_start, best_count = s, c
+            s = e
+        else:
+            s += 1
+    return best_start, best_count
+
+
+def _stride12_widths_ok(raw: bytes, start: int, count: int) -> bool:
+    """True if a stride‑12 run carries plausible per‑point pen widths.
+
+    A genuine stride‑12 buffer stores a real width (a few points) in every
+    third float.  A *stride‑8* buffer read at stride 12 instead has its y
+    values land in the width slot, so the "widths" come out in the hundreds —
+    implausible.  This separates a thin pen (stride‑12) from a widthless
+    marker (stride‑8): the red bar's mis-read widths are ~100+, a real pen's
+    are ~1‑3.
     """
-    if _flag_run_end(raw):
-        pts = _points_after_flag(raw)
-        if len(pts) >= 2:
-            return pts
+    for i in range(count):
+        w = _f32(raw, start + i * 12 + 8)
+        if w < 0.0 or w > 10.0:
+            return False
+    return True
+
+
+def _earliest_stride12(raw: bytes) -> Tuple[int, int]:
+    """Return ``(start, count)`` of the first run of >= 2 valid stride‑12
+    triplets at offset >= 64 (the original pen layout), else ``(0, 0)``."""
     n = len(raw)
     o = _POINT_SEARCH_START
     while o + _POINT_STRIDE <= n:
@@ -246,35 +286,61 @@ def extract_points(raw: bytes) -> List[Tuple[float, float, float]]:
                 count += 1
                 o += _POINT_STRIDE
             if count >= 2:
-                return [
-                    (_f32(raw, start + i * _POINT_STRIDE),
-                     _f32(raw, start + i * _POINT_STRIDE + 4),
-                     _f32(raw, start + i * _POINT_STRIDE + 8))
-                    for i in range(count)
-                ]
+                return start, count
             o = start + _POINT_STRIDE
         else:
             o += 1
+    return 0, 0
+
+
+def extract_points(raw: bytes) -> List[Tuple[float, float, float]]:
+    """Extract the stroke path from decompressed pen geometry.
+
+    Three layouts exist:
+      * **flag‑run**  ``[x0][y0][u32 count] + count*(x, y)`` after a long 0/1 run;
+      * **stride‑12** ``(x, y, width)`` — the primary pen layout (has width);
+      * **stride‑8**  ``(x, y)`` — a widthless marker layout (the red bar).
+    The stride‑12 run is taken when its per‑point widths are plausible (a real
+    pen); a stride‑8 buffer mis-read at stride 12 yields implausible widths
+    (its y values land in the width slot), so we fall back to the stride‑8
+    layout in that case.
+    """
+    if _flag_run_end(raw):
+        pts = _points_after_flag(raw)
+        if len(pts) >= 2:
+            return pts
+    s12, c12 = _earliest_stride12(raw)
+    if c12 >= 2 and _stride12_widths_ok(raw, s12, c12):
+        return [(_f32(raw, s12 + i * 12),
+                 _f32(raw, s12 + i * 12 + 4),
+                 _f32(raw, s12 + i * 12 + 8)) for i in range(c12)]
+    # Stride-12 run absent or implausible (it was a stride-8 buffer): read the
+    # widthless (x, y) layout.
+    s8, c8 = _longest_run(raw, 8, 0, 4)
+    if c8 >= 2:
+        return [(_f32(raw, s8 + i * 8), _f32(raw, s8 + i * 8 + 4), 0.0)
+                for i in range(c8)]
     return []
 
 
 def extract_curve(raw: bytes) -> List[Tuple[float, float]]:
-    """Extract a highlighter / eraser smooth curve from decompressed geometry.
+    """Extract a highlighter / eraser / pencil smooth curve.
 
-    Like :func:`extract_points` but the points are float32 ``(x, y)`` *pairs*
-    at stride 8 (no per-point width).  The buffer holds a style template and a
-    flag array before the real path; we scan for the *longest* run of
-    consecutive valid ``(x, y)`` pairs and keep it.  A run must also span real
-    distance (all-zero "eraser" placeholders are dropped).
+    Points are stored as stride‑20 records ``[a, b, c, x, y]`` (five float32s,
+    x at +12, y at +16) — the first three floats are per‑sample style attributes
+    (pressure/velocity), the last two are the position.  The buffer carries a
+    style template and flag array before the path; we keep the *longest*
+    contiguous run of valid ``(x, y)`` samples.  A run must span real distance
+    (all‑zero "eraser" placeholders are dropped).
     """
     n = len(raw)
-    if n < 16:
+    if n < 24:
         return []
 
     def valid(o: int) -> bool:
-        if o + 8 > n:
+        if o + 20 > n:
             return False
-        x, y = _f32(raw, o), _f32(raw, o + 4)
+        x, y = _f32(raw, o + 12), _f32(raw, o + 16)
         return 1.0 < x < 5000.0 and 1.0 < y < 5000.0
 
     best_start = best_len = 0
@@ -283,17 +349,17 @@ def extract_curve(raw: bytes) -> List[Tuple[float, float]]:
         if valid(s):
             e = s
             while valid(e):
-                e += 8
+                e += 20
             if e - s > best_len:
                 best_start, best_len = s, e - s
             s = e
         else:
             s += 1
-    count = best_len // 8
+    count = best_len // 20
     if count < 2:
         return []
-    pts = [(_f32(raw, best_start + i * 8), _f32(raw, best_start + i * 8 + 4))
-           for i in range(count)]
+    pts = [(_f32(raw, best_start + i * 20 + 12),
+            _f32(raw, best_start + i * 20 + 16)) for i in range(count)]
     xs = [p[0] for p in pts]
     ys = [p[1] for p in pts]
     if (max(xs) - min(xs)) < 0.5 and (max(ys) - min(ys)) < 0.5:
@@ -615,6 +681,44 @@ def _page_members(names) -> List[str]:
     return sorted(n for n in names if "/notes/" in n or n.startswith("notes/"))
 
 
+def _read_deleted_pages(opener, names) -> List[str]:
+    """Return the full 36-char ``notes/`` member names of *deleted* pages.
+
+    ``index.events.pb`` is the op log.  A page is created by an op carrying
+    field #54 and later deleted/hidden by an op carrying field #56 (the same
+    page UUID).  Deleted members are kept in the archive but must not produce
+    a page (the reference export omits them).  Note the op log stores an
+    *internal* page id that differs from the member name by one nibble in the
+    final hex byte, so matching is on the first 32 chars.
+    """
+    if "index.events.pb" not in names:
+        return []
+    try:
+        data = opener("index.events.pb")
+    except Exception:
+        return []
+    deleted = set()
+    for rec in read_length_delimited_records(data):
+        try:
+            top = parse_message(rec)
+        except Exception:
+            continue
+        f1 = top.get(1, [None])[0]
+        if not isinstance(f1, (bytes, bytearray)):
+            continue
+        fields = {k for k in top if k != 1}
+        if 56 in fields:
+            deleted.add(bytes(f1).decode("ascii", "ignore").strip()[:32])
+    if not deleted:
+        return []
+    out = []
+    for n in names:
+        if "/notes/" in n or n.startswith("notes/"):
+            if n.split("/")[-1][:32] in deleted:
+                out.append(n)
+    return out
+
+
 def _read_page_order(opener, names, fallback) -> List[str]:
     """Return page member names in document order.
 
@@ -707,8 +811,11 @@ def _read_page_members(opener, names, attachments, canvas,
     fallback = _page_members(names)
     order = _read_page_order(opener, names, fallback)
     bg_map = _read_page_backgrounds(opener, names)
+    deleted = set(_read_deleted_pages(opener, names))
     pages = []
     for name in order:
+        if name in deleted:
+            continue  # page was deleted; keep it out of the output
         data = opener(name)
         page = parse_page(data, attachments, canvas, page_size)
         paper = bg_map.get(name.split("/")[-1])
