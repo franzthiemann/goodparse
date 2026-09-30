@@ -209,27 +209,80 @@ def _flag_run_end(buf: bytes) -> int:
     return 0
 
 
-def _points_after_flag(raw: bytes) -> List[Tuple[float, float, float]]:
-    """Decode the flag-run encoding: ``[x0][y0][u32 count] + count*(x, y)``.
+def _stride8_scan(raw: bytes, start: int, max_gap: int = 3) -> List[Tuple[float, float, float]]:
+    """Collect stride-8 ``(x, y)`` pairs from ``start``, skipping isolated
+    invalid samples.
 
-    ``raw`` is the full buffer; the flag run's end is found first.  The per-point
-    width is not stored, so points carry width 0 (rendered at the nominal width).
+    A single garbage sample used to *truncate* a path: a closed loop drawn as
+    ~132 stride-8 points had one bad pair mid-way, so the old "longest
+    contiguous run" reader returned only the first ~half (the "cut short"
+    defect).  We now skip up to ``max_gap - 1`` consecutive invalid samples,
+    then stop when a longer non-point stretch begins.  Coordinates are gated
+    to the page bound so trailing template bytes are not collected.
+    """
+    pts: List[Tuple[float, float, float]] = []
+    bad = 0
+    o = start
+    while o + 8 <= len(raw):
+        x, y = _f32(raw, o), _f32(raw, o + 4)
+        if _COORD_MIN < x < _COORD_MAX and _COORD_MIN < y < _COORD_MAX:
+            pts.append((x, y, 0.0))
+            bad = 0
+        else:
+            bad += 1
+            if bad >= max_gap:
+                break
+        o += 8
+    return pts
+
+
+def _points_after_flag(raw: bytes) -> List[Tuple[float, float, float]]:
+    """Decode a genuine flag-run (stride-8 / stride-16) stroke.
+
+    Layout: ``template + flag-run + [x0][y0][u32 count] + point array`` where
+    ``base = fe + 12`` starts the array.  Two point layouts exist, distinguished
+    by the buffer-length signature ``rem = len(raw) - base``:
+
+    * ``rem == 16·count`` — **stride-16**: each 16-byte record holds two smooth
+      points ``(x, y, x', y')``; emit both.  (Freehand ink strokes.)
+    * ``rem == 8·count``  — **stride-8**: ``count`` single ``(x, y)`` points.
+    * ``rem > 8·count``   — **stride-8, spurious count**: the stored count is a
+      mis-read (e.g. the loop's left edge), so collect *all* valid stride-8
+      pairs up to a short gap.  This is what fixed closed loops that were being
+      cut short at the first bad sample.
+
+    A spurious flag-run (no valid points at ``base``) returns ``[]`` so the
+    caller can fall through to the stride-12 pen layout.
     """
     fe = _flag_run_end(raw)
-    if fe + 12 > len(raw):
+    base = fe + 12
+    if base > len(raw):
         return []
+    rem = len(raw) - base
     count = struct.unpack("<I", raw[fe + 8:fe + 12])[0]
-    p = fe + 12
-    pts: List[Tuple[float, float, float]] = []
-    for _ in range(count):
-        if p + 8 > len(raw):
-            break
-        x, y = _f32(raw, p), _f32(raw, p + 4)
-        if not (_COORD_MIN < x < _COORD_MAX and _COORD_MIN < y < _COORD_MAX):
-            break
-        pts.append((x, y, 0.0))
-        p += 8
-    return pts
+
+    # Stride-16: each record holds two points.
+    if 0 < count < 10_000_000 and rem == 16 * count:
+        pts: List[Tuple[float, float, float]] = []
+        for i in range(count):
+            o = base + i * 16
+            if o + 16 > len(raw):
+                break
+            x1, y1 = _f32(raw, o), _f32(raw, o + 4)
+            x2, y2 = _f32(raw, o + 8), _f32(raw, o + 12)
+            if _COORD_MIN < x1 < _COORD_MAX and _COORD_MIN < y1 < _COORD_MAX:
+                pts.append((x1, y1, 0.0))
+            if _COORD_MIN < x2 < _COORD_MAX and _COORD_MIN < y2 < _COORD_MAX:
+                pts.append((x2, y2, 0.0))
+        return pts if len(pts) >= 2 else []
+
+    # Stride-8: the count may be a spurious read; collect all valid pairs.
+    pts8 = _stride8_scan(raw, base)
+    if len(pts8) < 2:
+        return []
+    if 2 <= count < len(pts8) and rem == 8 * count:
+        return pts8[:count]
+    return pts8
 
 
 def _longest_run(raw: bytes, stride: int, xoff: int, yoff: int,
@@ -304,26 +357,32 @@ def _earliest_stride12(raw: bytes) -> Tuple[int, int]:
 def extract_points(raw: bytes) -> List[Tuple[float, float, float]]:
     """Extract the stroke path from decompressed pen geometry.
 
-    Three layouts exist:
-      * **flag‑run**  ``[x0][y0][u32 count] + count*(x, y)`` after a long 0/1 run;
-      * **stride‑12** ``(x, y, width)`` — the primary pen layout (has width);
-      * **stride‑8**  ``(x, y)`` — a widthless marker layout (the red bar).
-    The stride‑12 run is taken when its per‑point widths are plausible (a real
-    pen); a stride‑8 buffer mis-read at stride 12 yields implausible widths
-    (its y values land in the width slot), so we fall back to the stride‑8
-    layout in that case.
+    Layouts (checked in this order):
+      * **stride-12** ``(x, y, width)`` — a real pen, with plausible per-point
+        widths.  Checked *first* because a valid-width run is the most specific
+        signal: a spurious flag-run sitting before a stride-12 pen used to
+        steal it (the Test4 red stroke).
+      * **flag-run**  ``template + flag-run + [x0][y0][u32 count] + points`` —
+        a genuine widthless stroke (stride-8 / stride-16).  Taken when the
+        buffer length matches the stored count (or the count is a spurious
+        mis-read) and no valid stride-12 pen exists.
+      * **stride-8**  ``(x, y)`` — a widthless marker (the red bar), read via
+        the longest contiguous run when the flag-run signature doesn't hold.
     """
-    if _flag_run_end(raw):
-        pts = _points_after_flag(raw)
-        if len(pts) >= 2:
-            return pts
     s12, c12 = _earliest_stride12(raw)
     if c12 >= 2 and _stride12_widths_ok(raw, s12, c12):
         return [(_f32(raw, s12 + i * 12),
                  _f32(raw, s12 + i * 12 + 4),
                  _f32(raw, s12 + i * 12 + 8)) for i in range(c12)]
-    # Stride-12 run absent or implausible (it was a stride-8 buffer): read the
-    # widthless (x, y) layout.
+    # No valid stride-12 pen.  A genuine flag-run is identified by a buffer
+    # length that is a whole multiple of the per-record stride (8 or 16 bytes)
+    # times the stored count, or by a count too small to fill the buffer
+    # (spurious mis-read -> collect all valid pairs).
+    if _flag_run_end(raw):
+        pts = _points_after_flag(raw)
+        if len(pts) >= 2:
+            return pts
+    # Stride-8 widthless marker: longest contiguous (x, y) run.
     s8, c8 = _longest_run(raw, 8, 0, 4)
     if c8 >= 2:
         return [(_f32(raw, s8 + i * 8), _f32(raw, s8 + i * 8 + 4), 0.0)

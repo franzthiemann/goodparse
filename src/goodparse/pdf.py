@@ -184,15 +184,15 @@ def _emit_text(parts: List[str], t: TextBox, s: float, h: float,
         runs=[SimpleNamespace(text=t.plain, bold=False, italic=False,
                               underline=False, strike=False, color=t.color)])]
 
-    # Flatten every run into (word, run-attrs) tokens, splitting on spaces so
-    # we can wrap mid-run; spaces rejoin the following word.
+    # Flatten every run into (word, run-attrs) tokens, keeping each word's
+    # trailing space so styled runs join with the exact spacing of the original
+    # (GoodNotes packs words tight: "Test123italic" with no added spaces).
     tokens = []
     for line in lines:
         for run in line.runs:
             if not run.text:
                 continue
-            words = run.text.split(" ")
-            for wi, w in enumerate(words):
+            for w in run.text.split(" "):
                 if not w:
                     continue
                 tokens.append(SimpleNamespace(
@@ -231,13 +231,13 @@ def _emit_text(parts: List[str], t: TextBox, s: float, h: float,
                 f"BT {cursor:.2f} {baseline:.2f} Td ({_pdf_escape(seg)}) Tj ET")
             w = _run_width(seg, fs)
             if tok.underline:
-                uy = h - (top + (j + 1) * leading * 0.94)
+                uy = baseline - fs * 0.12
                 parts.append(f"{_num(r)} {_num(g)} {_num(b)} RG")
                 parts.append(f"{max(0.5, fs * 0.05):.2f} w "
                              f"{cursor:.2f} {uy:.2f} m "
                              f"{cursor + w:.2f} {uy:.2f} l S")
             if tok.strike:
-                sy = h - (top + (j + 1) * leading * 0.5)
+                sy = baseline + fs * 0.33
                 parts.append(f"{_num(r)} {_num(g)} {_num(b)} RG")
                 parts.append(f"{max(0.5, fs * 0.05):.2f} w "
                              f"{cursor:.2f} {sy:.2f} m "
@@ -259,7 +259,11 @@ def _page_content(page, width_scale: float, alpha_name: Dict[float, str],
     """
     s = page.scale
     h = page.height
-    out: List[str] = ["J 1", "j 1"]  # round line cap, round line join
+    # NOTE: the round cap/join (J/j) is emitted *per stroke*, just before that
+    # stroke's width, not here.  pypdfium2/Skia drops the stroke colour to
+    # black when a J or j operator appears *immediately before* an ``RG``;
+    # keeping a ``w`` between them avoids that (see the per-stroke emission).
+    out: List[str] = []
     xrefs: List[str] = []
     img_bodies: Dict[int, bytes] = {}
     counter = [next_num]
@@ -298,21 +302,49 @@ def _page_content(page, width_scale: float, alpha_name: Dict[float, str],
                        f"{_num(px, 2)} {_num(ypdf, 2)} cm /{name} Do Q")
 
     # --- strokes ------------------------------------------------------------ #
-    for stroke in page.strokes:
+    # GoodNotes stores each page's strokes in *reverse* paint order (the
+    # topmost, last-drawn stroke comes first in the file), so render them in
+    # reverse to restore the intended layering (e.g. the basketball's black
+    # seams sit on top of the orange fill).
+    for stroke in reversed(page.strokes):
         r, g, b, a = stroke.color
+        pts = _stroke_points(stroke)
+        widths = [max(_MIN_WIDTH, w * width_scale * s) for _x, _y, w in pts]
+        if len(pts) < 2:
+            continue
+        # Emission order matters: caps (J/j) must be separated from ``RG`` by
+        # a ``w``.  pypdfium2/Skia renders the stroke black when a cap/join
+        # operator appears immediately before the colour, so go
+        # caps -> width -> colour -> path.
+        out.append("J 1")
+        out.append("j 1")
+        # A uniform-width stroke is one continuous path: 131 overlapping
+        # per-segment round caps would blend to a muddy grey under alpha (and
+        # produce the "highlighter rectangles" artifact).  Only a pressure
+        # (width-varying) stroke needs per-segment paths, and even then only
+        # where the width actually changes.
+        uniform = max(widths) - min(widths) < 1e-6
+        # Always emit a width before ``RG`` so the caps above are separated
+        # from the colour; for a pressure stroke this is just a lead-in
+        # (each segment below sets its own width).
+        out.append(f"{_num(widths[0])} w")
         out.append(f"{_num(r)} {_num(g)} {_num(b)} RG")
         if a < 1.0:
             out.append(f"/{alpha_name[a]} gs")
-        pts = _stroke_points(stroke)
-        widths = [max(_MIN_WIDTH, w * width_scale * s) for _x, _y, w in pts]
-        for k in range(len(pts) - 1):
-            w = (widths[k] + widths[k + 1]) / 2.0
-            x0, y0, _w0 = pts[k]
-            x1, y1, _w1 = pts[k + 1]
-            out.append(f"{_num(w)} w")
-            out.append(f"{_num(x0 * s, 2)} {_num(h - y0 * s, 2)} m")
-            out.append(f"{_num(x1 * s, 2)} {_num(h - y1 * s, 2)} l")
+        if uniform:
+            out.append(f"{_num(pts[0][0] * s, 2)} {_num(h - pts[0][1] * s, 2)} m")
+            for k in range(1, len(pts)):
+                out.append(f"{_num(pts[k][0] * s, 2)} {_num(h - pts[k][1] * s, 2)} l")
             out.append("S")
+        else:
+            for k in range(len(pts) - 1):
+                w = (widths[k] + widths[k + 1]) / 2.0
+                x0, y0, _w0 = pts[k]
+                x1, y1, _w1 = pts[k + 1]
+                out.append(f"{_num(w)} w")
+                out.append(f"{_num(x0 * s, 2)} {_num(h - y0 * s, 2)} m")
+                out.append(f"{_num(x1 * s, 2)} {_num(h - y1 * s, 2)} l")
+                out.append("S")
 
     # --- text --------------------------------------------------------------- #
     if has_font:
