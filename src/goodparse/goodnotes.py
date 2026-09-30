@@ -902,22 +902,196 @@ def _read_page_backgrounds(opener, names) -> Dict[str, str]:
 def _read_page_members(opener, names, attachments, canvas,
                        page_size) -> List[Page]:
     """Parse every ``notes/<UUID>`` member, in document order, keeping empty
-    pages (a page may hold only a background)."""
-    fallback = _page_members(names)
-    order = _read_page_order(opener, names, fallback)
+    pages (a page may hold only a background).
+
+    Per-page geometry (size + scale) is read from the event log: in current
+    GoodNotes builds each page has its own canvas (``f54`` -> layer ->
+    create-info ``f8``), so a single global page size is wrong for documents
+    mixing page sizes (A4 + landscape + strips).  Old builds, which carry no
+    such per-page canvas, fall back to the global ``canvas``/``page_size``.
+    """
+    member_names = _page_members(names)
+    meta = _read_page_meta(opener, names, member_names)
+
+    # bare-member-name (no "notes/" prefix) -> (canvas, paper)
+    per_page = {m.split("/")[-1]: (c, p) for m, _p, c, p in meta}
+
+    order: List[str] = []
+    if meta:
+        for m, _layer, _c, _p in meta:
+            if m and m not in order:
+                order.append(m)
+    for m in _read_page_order(opener, names, member_names):  # defensive fill
+        if m not in order:
+            order.append(m)
+
     bg_map = _read_page_backgrounds(opener, names)
     deleted = set(_read_deleted_pages(opener, names))
     pages = []
     for name in order:
         if name in deleted:
             continue  # page was deleted; keep it out of the output
+        member = name.split("/")[-1]
         data = opener(name)
-        page = parse_page(data, attachments, canvas, page_size)
-        paper = bg_map.get(name.split("/")[-1])
+        p_canvas, p_paper = per_page.get(member, (None, None))
+        if p_canvas:
+            ps = _paper_size(opener, names, p_paper)
+            page = parse_page(data, attachments, p_canvas, ps)
+        else:
+            page = parse_page(data, attachments, canvas, page_size)
+        paper = p_paper or bg_map.get(member)
         if paper and paper in attachments:
             page.background = attachments[paper]
         pages.append(page)
     return pages
+
+
+_UUID_RE = re.compile(
+    rb"([0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12})")
+
+
+def _iter_fields_tolerant(data: bytes):
+    """Yield protobuf fields, skipping the group wire-types (4/6) that current
+    GoodNotes uses in its index files, and stopping at a truncated/unknown field
+    instead of raising."""
+    i = 0
+    n = len(data)
+    while i < n:
+        if i + 1 > n:
+            return
+        key, i = _read_varint(data, i)
+        field = key >> 3
+        wt = key & 7
+        if wt == 0:
+            val, i = _read_varint(data, i)
+            yield field, wt, val
+        elif wt == 2:
+            ln, i = _read_varint(data, i)
+            if i + ln > n:
+                return
+            yield field, wt, data[i:i + ln]
+            i += ln
+        elif wt == 5:
+            if i + 4 > n:
+                return
+            yield field, wt, struct.unpack_from("<f", data, i)[0]
+            i += 4
+        elif wt == 1:
+            if i + 8 > n:
+                return
+            yield field, wt, struct.unpack_from("<d", data, i)[0]
+            i += 8
+        elif wt in (4, 6):  # group start/end marker, no payload
+            yield field, wt, None
+        else:
+            return
+
+
+def _fields_tolerant(data: bytes) -> Dict[int, List[object]]:
+    out: Dict[int, List[object]] = {}
+    for field, _wt, val in _iter_fields_tolerant(data):
+        out.setdefault(field, []).append(val)
+    return out
+
+
+def _uuid_from(v) -> Optional[str]:
+    if not isinstance(v, (bytes, bytearray)):
+        return None
+    m = _UUID_RE.search(bytes(v))
+    return m.group(1).decode("ascii").upper() if m else None
+
+
+def _paper_size(opener, names, paper) -> Optional[Tuple[float, float]]:
+    """Page size from a paper PDF attachment's MediaBox ``[0 0 W H]``."""
+    if not paper or f"attachments/{paper}" not in names:
+        return None
+    try:
+        data = opener(f"attachments/{paper}")
+    except Exception:
+        return None
+    if not data.startswith(b"%PDF"):
+        return None
+    m = re.search(
+        rb"/MediaBox\s*\[\s*([\d.]+)\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)\s*\]", data)
+    if not m:
+        m = re.search(rb"/MediaBox\s*\[0\s+0\s+([\d.]+)\s+([\d.]+)\]", data)
+        if m:
+            return (float(m.group(1)), float(m.group(2)))
+        return None
+    return (float(m.group(3)), float(m.group(4)))
+
+
+def _read_page_meta(opener, names, member_names) -> List[Tuple[str, str,
+                                                                Optional[Tuple[float, float]], Optional[str]]]:
+    """Derive per-page metadata from ``index.events.pb``.
+
+    Returns ``[(member_name, layer, canvas_wh_or_None, paper_uuid_or_None)]`` in
+    display order.  Each entry resolves a page's ``f54`` create op (page UUID in
+    field 2, layer in field 3) to that layer's create-info op (top field 1 =
+    layer, nested field ``f2.f4`` = paper, ``f2.f8`` = canvas dims).  When the
+    event log is absent or carries no canvas dims this returns ``[]`` and the
+    caller falls back to the single global canvas/page size.
+    """
+    if "index.events.pb" not in names:
+        return []
+    try:
+        data = opener("index.events.pb")
+    except Exception:
+        return []
+    try:
+        recs = list(read_length_delimited_records(data))
+    except Exception:
+        return []
+
+    # 1) layer create-info ops: top f1 = layer UUID, f2 = info message.
+    layer_info: Dict[str, Tuple[Optional[str], Optional[Tuple[float, float]]]] = {}
+    for rec in recs:
+        t = _fields_tolerant(rec)
+        if 1 not in t or 2 not in t:
+            continue
+        layer = _uuid_from(t[1][0])
+        info = t[2][0]
+        if not layer or not isinstance(info, (bytes, bytearray)):
+            continue
+        paper: Optional[str] = None
+        cxy: Optional[Tuple[float, float]] = None
+        for f, _wt, v in _iter_fields_tolerant(info):
+            if f == 4:
+                paper = _uuid_from(v) or paper
+            elif f == 8 and isinstance(v, (bytes, bytearray)):
+                cf = _fields_tolerant(v)
+                if 1 in cf and 2 in cf:
+                    w, h = cf[1][0], cf[2][0]
+                    if 100 < w < 5000 and 100 < h < 5000:
+                        cxy = (float(w), float(h))
+        if cxy:
+            layer_info[layer] = (paper, cxy)
+        elif paper:
+            # paper known but no canvas yet; keep the best (canvas) if seen
+            prev = layer_info.get(layer)
+            if not prev or not prev[1]:
+                layer_info[layer] = (paper, prev[1] if prev else None)
+
+    # 2) page order: f54 create ops (page UUID f2, layer f3).
+    member_prefix = {p32: m for p32, m in
+                     ((m[-36:][:32], m) for m in member_names)}
+    out: List[Tuple[str, str, Optional[Tuple[float, float]], Optional[str]]] = []
+    for rec in recs:
+        t = _fields_tolerant(rec)
+        if 54 not in t:
+            continue
+        page = layer = None
+        for f, _wt, v in _iter_fields_tolerant(t[54][0]):
+            if f == 2:
+                page = _uuid_from(v) or page
+            elif f == 3:
+                layer = _uuid_from(v) or layer
+        if not page:
+            continue
+        member = member_prefix.get(page[:32])
+        paper, cxy = layer_info.get(layer, (None, None)) if layer else (None, None)
+        out.append((member, layer, cxy, paper))
+    return out
 
 
 def _collect_attachments(opener, names) -> Dict[str, bytes]:
