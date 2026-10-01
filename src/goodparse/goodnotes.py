@@ -927,6 +927,14 @@ def _read_page_members(opener, names, attachments, canvas,
 
     bg_map = _read_page_backgrounds(opener, names)
     deleted = set(_read_deleted_pages(opener, names))
+    paper_att = _read_paper_to_attachment(opener, names)
+
+    def resolve_paper(paper):
+        if not paper:
+            return None
+        # a paper UUID may be an internal id; map to its real attachment
+        return paper_att.get(paper, paper)
+
     pages = []
     for name in order:
         if name in deleted:
@@ -935,11 +943,11 @@ def _read_page_members(opener, names, attachments, canvas,
         data = opener(name)
         p_canvas, p_paper = per_page.get(member, (None, None))
         if p_canvas:
-            ps = _paper_size(opener, names, p_paper)
+            ps = _paper_size(opener, names, resolve_paper(p_paper))
             page = parse_page(data, attachments, p_canvas, ps)
         else:
             page = parse_page(data, attachments, canvas, page_size)
-        paper = p_paper or bg_map.get(member)
+        paper = resolve_paper(p_paper) or resolve_paper(bg_map.get(member))
         if paper and paper in attachments:
             page.background = attachments[paper]
         pages.append(page)
@@ -1101,6 +1109,43 @@ def _collect_attachments(opener, names) -> Dict[str, bytes]:
             data = opener(n)
             if data:
                 out[n.split("/")[-1]] = data
+    return out
+
+
+def _read_paper_to_attachment(opener, names) -> Dict[str, str]:
+    """Map an *internal* paper UUID to its backing ``attachments/`` UUID.
+
+    Most papers are stored under their own UUID, but some (e.g. imported or
+    template papers) have an internal id that differs from the attachment
+    filename.  An op whose field #1 is the paper UUID and whose field #6
+    sub-message's field #2 is the attachment UUID records that mapping.
+    Papers that map to themselves are the common case; the mapping is only
+    needed to resolve the rest.
+    """
+    if "index.events.pb" not in names:
+        return {}
+    try:
+        data = opener("index.events.pb")
+    except Exception:
+        return {}
+    out: Dict[str, str] = {}
+    try:
+        recs = list(read_length_delimited_records(data))
+    except Exception:
+        return {}
+    for rec in recs:
+        t = _fields_tolerant(rec)
+        if 1 not in t or 6 not in t:
+            continue
+        paper = _uuid_from(t[1][0])
+        v6 = t[6][0]
+        if not paper or not isinstance(v6, (bytes, bytearray)):
+            continue
+        sub = _fields_tolerant(v6)
+        if 2 in sub:
+            att = _uuid_from(sub[2][0])
+            if att:
+                out[paper] = att
     return out
 
 

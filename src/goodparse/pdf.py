@@ -123,8 +123,16 @@ def _font_name(bold: bool, italic: bool,
     return "/" + font_map.get((bold, italic), "F1")
 
 
-def _raster_to_jpeg(data: bytes) -> Optional[Tuple[int, int, bytes]]:
-    """Decode an embedded raster (PNG/JPEG) and re-encode it as RGB JPEG."""
+def _raster_to_jpeg(data: bytes, place_w: float = 0.0,
+                    place_h: float = 0.0) -> Optional[Tuple[int, int, bytes]]:
+    """Decode an embedded raster (PNG/JPEG) and re-encode it as RGB JPEG.
+
+    When the placed box (``place_w`` x ``place_h`` points) has a *portrait*
+    aspect but the source raster is *landscape* (or vice versa), GoodNotes
+    has rotated the image 90 degrees on the page.  We reproduce that rotation
+    (counter-clockwise, matching the reference) so the photo isn't squished.
+    A zero ``place_w``/``place_h`` means "no box info" and disables detection.
+    """
     if _PILImage is None or not data:
         return None
     import io
@@ -133,6 +141,13 @@ def _raster_to_jpeg(data: bytes) -> Optional[Tuple[int, int, bytes]]:
             rgb = im.convert("RGB")
     except Exception:
         return None
+    if place_w > 0 and place_h > 0:
+        native_ar = rgb.width / rgb.height
+        placed_ar = place_w / place_h
+        # |native - placed| large AND native*placed ~ 1 -> the axes are swapped,
+        # i.e. a 90-degree rotation.  0.15 catches 4:3/3:4, 16:9/9:16, etc.
+        if abs(native_ar - placed_ar) > 0.15 and abs(native_ar * placed_ar - 1.0) < 0.5:
+            rgb = rgb.rotate(270, expand=True)  # CCW 90 degrees
     buf = io.BytesIO()
     rgb.save(buf, format="JPEG", quality=_JPEG_QUALITY)
     return rgb.width, rgb.height, buf.getvalue()
@@ -286,7 +301,7 @@ def _page_content(page, width_scale: float, alpha_name: Dict[float, str],
     # --- embedded photos ---------------------------------------------------- #
     if _has_raster():
         for img in page.images:
-            rj = _raster_to_jpeg(img.data)
+            rj = _raster_to_jpeg(img.data, img.size[0], img.size[1])
             if not rj:
                 continue
             w, hh, jpg = rj
