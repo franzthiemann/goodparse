@@ -480,6 +480,59 @@ def _find_geometry_blob(content_fields) -> Optional[bytes]:
     return None
 
 
+def _vector_shape_points(content_fields) -> List[Tuple[float, float]]:
+    """Read the control points of a GoodNotes *vector shape* from field ``#9``.
+
+    Shapes (line / triangle / polygon / small marks) store their defining
+    points as ``{1: x, 2: y}`` float32 messages inside field ``#9``.  The
+    container varies: either repeated points under ``f9.f1`` or a single
+    message whose points are numbered sub-fields (``f9.f2.f1/f2/f3``).  Both
+    layouts are covered by a recursive walk that collects every
+    ``{1: float, 2: float}`` leaf it finds.
+
+    ``f9.f4`` is deliberately ignored: it holds a transform / bounds anchor
+    (two floats plus a scalar) that spans the whole page, not ink — decoding
+    it would draw a giant diagonal.  Coordinates are canvas units, same space
+    as the freehand strokes.  Returns ``[]`` when the record carries no such
+    point container (fewer than two points, or a ``#9`` that is only the
+    ``f4`` anchor).
+    """
+    for blob in content_fields.get(9, []):
+        if not isinstance(blob, (bytes, bytearray)):
+            continue
+        top: List[Tuple[int, int, bytes]] = []
+        try:
+            top = [(f, wt, bytes(v)) for f, wt, v in _iter_fields_tolerant(blob)
+                   if isinstance(v, (bytes, bytearray))]
+        except (ValueError, struct.error):
+            continue
+        pts: List[Tuple[float, float]] = []
+        for f, _wt, v in top:
+            if f not in (1, 2):  # f4 = transform anchor, not ink
+                continue
+            _collect_shape_points(v, pts)
+        if len(pts) >= 2:
+            return pts
+    return []
+
+
+def _collect_shape_points(blob: bytes, out: List[Tuple[float, float]]) -> None:
+    """Recursively collect ``{1: x, 2: y}`` point leaves from a shape frame."""
+    try:
+        fields = list(iter_fields(blob))
+    except (ValueError, struct.error):
+        return
+    # Is this blob itself a point message?
+    vals = {f: v for f, _wt, v in fields}
+    if (set(vals) == {1, 2} and isinstance(vals.get(1), float)
+            and isinstance(vals.get(2), float)):
+        out.append((vals[1], vals[2]))
+        return
+    for _f, _wt, v in fields:
+        if isinstance(v, (bytes, bytearray)):
+            _collect_shape_points(bytes(v), out)
+
+
 # --------------------------------------------------------------------------- #
 # Placement matrix helpers (shared by images and text boxes)
 # --------------------------------------------------------------------------- #
@@ -674,11 +727,23 @@ def _parse_stroke(cf, scale: float = 1.0) -> Optional[Stroke]:
             fp_color = (0.30, 0.30, 0.30, 1.0)
             return Stroke(points=[(x, y, w_canvas) for x, y in f4_pts],
                           color=fp_color, kind="pen")
+    # Vector shapes (line / rect / ellipse / triangle / polygon) keep their
+    # defining control points in field #9, and their field-#2 LZ4 blob is only
+    # the "tpl" style template (decodes to no points) — so extract_points()
+    # yields nothing.  Handle them before the empty-points bail-out: 2 points
+    # = open line, 3 = triangle, 4+ = closed polygon.
     if not pts:
+        shape_pts = _vector_shape_points(cf)
+        if shape_pts:
+            # f4 for a vector shape is a width *float* (or absent), not an
+            # RGBA blob, so the ink is the default pen colour (black).  Width
+            # is a single canvas-unit float in the tpl template; use default.
+            w_canvas = _PEN_DEFAULT_WIDTH_PT
+            return Stroke(points=[(x, y, w_canvas) for x, y in shape_pts],
+                          color=(0.0, 0.0, 0.0, 1.0), kind="pen")
         return None
-    # flag-run / stride-8 strokes store no per-point width.  If the buffer
-    # carries a marker width float (offset 40) use it — GoodNotes markers have
-    # a single uniform width; otherwise fall back to the default pen width.
+    # If the buffer carries a marker width float (offset 40) use it — GoodNotes
+    # markers have a single uniform width; otherwise fall back to the default pen width.
     if all(w == 0.0 for _x, _y, w in pts):
         mw = _marker_width(raw)
         if mw is not None and scale > 0:
