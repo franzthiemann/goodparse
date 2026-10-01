@@ -34,6 +34,7 @@ RTF source (Cocoa RTF), and another is the RGBA colour.
 
 from __future__ import annotations
 
+import math
 import os
 import re
 import struct
@@ -533,6 +534,66 @@ def _collect_shape_points(blob: bytes, out: List[Tuple[float, float]]) -> None:
             _collect_shape_points(bytes(v), out)
 
 
+def _vector_oval_points(content_fields) -> List[Tuple[float, float]]:
+    """Sample a GoodNotes *oval/ellipse* vector shape from field ``#9``.
+
+    Oval shapes (type codes 30/31/36/39, etc.) don't store explicit vertices:
+    field ``f9.f4`` holds the ellipse as a **center point** (``f4.f1`` =
+    ``{1: x, 2: y}``), **two semi-axes** (``f4.f2`` = ``{1: rx, 2: ry}``) and
+    a **rotation angle in radians** (``f4.f3``).  This is the layout that
+    `_vector_shape_points` deliberately skips (it reads only ``f9.f1``/``f9.f2``),
+    so ovals came back missing.  We sample the ellipse into a closed polygon of
+    ``steps`` vertices (canvas units, same space as freehand strokes) so the PDF
+    emitter draws it like any polygon.  Returns ``[]`` when the record has no
+    such oval frame.  (``rx == ry`` yields a circle, e.g. the tiny dots.)
+    """
+    for blob in content_fields.get(9, []):
+        if not isinstance(blob, (bytes, bytearray)):
+            continue
+        f4 = None
+        try:
+            for f, _wt, v in _iter_fields_tolerant(blob):
+                if f == 4 and isinstance(v, (bytes, bytearray)):
+                    f4 = bytes(v)
+                    break
+        except (ValueError, struct.error):
+            continue
+        if f4 is None:
+            continue
+        cx = cy = rx = ry = None
+        rot = 0.0
+        try:
+            sub = {f: v for f, _wt, v in _iter_fields_tolerant(f4)}
+        except (ValueError, struct.error):
+            continue
+        c = sub.get(1)
+        a = sub.get(2)
+        if not (isinstance(c, (bytes, bytearray)) and isinstance(a, (bytes, bytearray))):
+            continue
+        try:
+            cp = {f: v for f, _wt, v in iter_fields(c)}
+            ax = {f: v for f, _wt, v in iter_fields(a)}
+        except (ValueError, struct.error):
+            continue
+        cx, cy = cp.get(1), cp.get(2)
+        rx, ry = ax.get(1), ax.get(2)
+        if None in (cx, cy, rx, ry):
+            continue
+        if not all(isinstance(v, float) for v in (cx, cy, rx, ry)):
+            continue
+        rot = sub.get(3, 0.0) if isinstance(sub.get(3), float) else 0.0
+        ca, sa = math.cos(rot), math.sin(rot)
+        steps = 64
+        pts: List[Tuple[float, float]] = []
+        for i in range(steps + 1):
+            t = 2.0 * math.pi * i / steps
+            lx = rx * math.cos(t)
+            ly = ry * math.sin(t)
+            pts.append((cx + lx * ca - ly * sa, cy + lx * sa + ly * ca))
+        return pts
+    return []
+
+
 # --------------------------------------------------------------------------- #
 # Placement matrix helpers (shared by images and text boxes)
 # --------------------------------------------------------------------------- #
@@ -734,6 +795,8 @@ def _parse_stroke(cf, scale: float = 1.0) -> Optional[Stroke]:
     # = open line, 3 = triangle, 4+ = closed polygon.
     if not pts:
         shape_pts = _vector_shape_points(cf)
+        if not shape_pts:
+            shape_pts = _vector_oval_points(cf)
         if shape_pts:
             # f4 for a vector shape is a width *float* (or absent), not an
             # RGBA blob, so the ink is the default pen colour (black).  Width
