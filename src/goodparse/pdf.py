@@ -331,6 +331,14 @@ def _page_content(page, width_scale: float, alpha_name: Dict[float, str],
         # a ``w``.  pypdfium2/Skia renders the stroke black when a cap/join
         # operator appears immediately before the colour, so go
         # caps -> width -> colour -> path.
+        #
+        # Each stroke is wrapped in a graphics-state save/restore (q … Q) so
+        # the alpha ExtGState set for a translucent stroke (pencil / tape /
+        # highlighter at alpha < 1) cannot *leak* to the next stroke.  Without
+        # it, every subsequent opaque stroke inherits the 0.5 alpha and renders
+        # as a faint gray band over the grid (the "gray ovals / too-transparent
+        # triangle" bug).  q/Q also isolates the per-stroke width/caps.
+        out.append("q")
         out.append("J 1")
         out.append("j 1")
         # A uniform-width stroke is one continuous path: 131 overlapping
@@ -360,6 +368,7 @@ def _page_content(page, width_scale: float, alpha_name: Dict[float, str],
                 out.append(f"{_num(x0 * s, 2)} {_num(h - y0 * s, 2)} m")
                 out.append(f"{_num(x1 * s, 2)} {_num(h - y1 * s, 2)} l")
                 out.append("S")
+        out.append("Q")
 
     # --- text --------------------------------------------------------------- #
     if has_font:

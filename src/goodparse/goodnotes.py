@@ -78,6 +78,23 @@ _HL_DEFAULT_WIDTH_PT = 10.0
 # read as proper bands.
 _PEN_DEFAULT_WIDTH_PT = 20.0
 
+# Pencil strokes (grayscale + semi-transparent, widthless flag-run encoding)
+# fall back to _PEN_DEFAULT_WIDTH_PT, which smears them into fat ~11 pt bands.
+# The reference draws the gray pencil doodle at ~4 pt (pixel-density match:
+# 17568 vs 17615 ref gray px at 4 pt on the laptop region, vs 13922 at 2 pt).
+# Apply this only to gray, alpha<0.9 strokes — never to black marks (alpha 1.0)
+# or colored tape (not gray), which keep the thick default on purpose.
+_PENCIL_DEFAULT_WIDTH_PT = 4.0
+
+# Vector shapes (line / oval / triangle / polygon) draw as crisp ~5 pt black
+# outlines in the reference.  Their widthless default is _PEN_DEFAULT_WIDTH_PT
+# (10.91 pt), which is ~2x too heavy: a fat black ring anti-aliases into a soft
+# gray band, so the ovals/triangle read as "gray / faint / too transparent"
+# instead of crisp black.  The tpl template's width (f9.f15 = 10.394 canvas
+# units) × scale = 5.67 pt, matching the measured reference ring (~5.2 pt).
+# Store in canvas units like every other stroke width.
+_SHAPE_DEFAULT_WIDTH_PT = 10.4
+
 # Marker strokes store a *uniform* width as a single float32 at byte 40 of the
 # decompressed geometry blob (after the "tpl\0"+length+style-template header).
 # A pen stroke has no such header (its bytes 40-43 are part of the template and
@@ -746,6 +763,40 @@ def _marker_width(raw: bytes) -> Optional[float]:
     return None
 
 
+def _is_pencil(color) -> bool:
+    """True for a GoodNotes *pencil* stroke: grayscale and semi-transparent.
+
+    Pencil ink is stored as gray (r == g == b) at alpha ~0.5, and uses the
+    widthless flag-run encoding (no offset-40 width, no per-point width).  This
+    separates it from black marks (alpha ~1.0) and colored tape (not gray), so
+    only pencil gets the thin width.  (A black marker has alpha 1.0; a colored
+    tape has r != g != b.)
+    """
+    r, g, b, a = color
+    return abs(r - g) < 0.02 and abs(g - b) < 0.02 and a < 0.9
+
+
+def _shape_template_width(content_fields) -> Optional[float]:
+    """Read a vector shape's width from its ``f9.f15`` template float.
+
+    Every f9 shape record carries a single canvas-unit float in ``f9.f15`` (the
+    stroke template's width).  For the Test9 ovals/triangle that value is
+    10.394 canvas units → 10.394 × scale(6/11) = 5.67 pt, matching the measured
+    reference ring (~5.2 pt).  Returns ``None`` when the field is absent or not
+    a plausible width, so the caller falls back to ``_SHAPE_DEFAULT_WIDTH_PT``.
+    """
+    for blob in content_fields.get(9, []):
+        if not isinstance(blob, (bytes, bytearray)):
+            continue
+        try:
+            for f, _wt, v in _iter_fields_tolerant(blob):
+                if f == 15 and isinstance(v, float) and 0.05 < v < 200.0:
+                    return v
+        except (ValueError, struct.error):
+            continue
+    return None
+
+
 def _parse_stroke(cf, scale: float = 1.0) -> Optional[Stroke]:
     """Build a Stroke from a field ``#7`` content message."""
     blob = _find_geometry_blob(cf)
@@ -799,9 +850,13 @@ def _parse_stroke(cf, scale: float = 1.0) -> Optional[Stroke]:
             shape_pts = _vector_oval_points(cf)
         if shape_pts:
             # f4 for a vector shape is a width *float* (or absent), not an
-            # RGBA blob, so the ink is the default pen colour (black).  Width
-            # is a single canvas-unit float in the tpl template; use default.
-            w_canvas = _PEN_DEFAULT_WIDTH_PT
+            # RGBA blob, so the ink is the default pen colour (black).  The
+            # shape's real width is the canvas-unit float in f9.f15 (the tpl
+            # template), matching the reference ring; fall back to the measured
+            # default when absent.  Storing canvas units lets the emitter ×scale.
+            w_canvas = _shape_template_width(cf)
+            if w_canvas is None:
+                w_canvas = _SHAPE_DEFAULT_WIDTH_PT
             return Stroke(points=[(x, y, w_canvas) for x, y in shape_pts],
                           color=(0.0, 0.0, 0.0, 1.0), kind="pen")
         return None
@@ -814,6 +869,10 @@ def _parse_stroke(cf, scale: float = 1.0) -> Optional[Stroke]:
             # Test7's three known marker lines); store canvas units so the PDF
             # emitter's ×scale yields the right page thickness.
             w_canvas = mw * 0.25 / scale
+        elif _is_pencil(color):
+            # Grayscale, semi-transparent, widthless = the pencil.  Thin it
+            # down from the fat marker default so the gray doodle doesn't smear.
+            w_canvas = (_PENCIL_DEFAULT_WIDTH_PT / scale) if scale > 0 else _PENCIL_DEFAULT_WIDTH_PT
         else:
             w_canvas = _PEN_DEFAULT_WIDTH_PT
         pts = [(x, y, w_canvas) for x, y, _w in pts]
