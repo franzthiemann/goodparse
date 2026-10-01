@@ -635,9 +635,7 @@ def _marker_width(raw: bytes) -> Optional[float]:
 def _parse_stroke(cf, scale: float = 1.0) -> Optional[Stroke]:
     """Build a Stroke from a field ``#7`` content message."""
     blob = _find_geometry_blob(cf)
-    if blob is None:
-        return None
-    raw = apple_decompress(blob)
+    raw = apple_decompress(blob) if blob is not None else None
     color = _extract_color(cf)
     tool_id = cf.get(21, [None])[0]
 
@@ -649,7 +647,33 @@ def _parse_stroke(cf, scale: float = 1.0) -> Optional[Stroke]:
         return Stroke(points=[(x, y, w) for x, y in pts], color=color,
                       kind="highlighter")
 
-    pts = extract_points(raw)
+    pts = extract_points(raw) if raw is not None else []
+    # Fountain-pen / pressure strokes in the latest build carry their points as
+    # repeated field-#4 point messages ({1: x, 2: y}, no per-point width) rather
+    # than an LZ4 blob.  A single uniform width float lives in field #6.  Only
+    # fall back to this when there is no LZ4 geometry (raw is None), so the
+    # colour blob in #4 of a normal stroke is never mistaken for points.
+    if not pts and raw is None:
+        f4_pts = []
+        for p in cf.get(4, []):
+            if not isinstance(p, (bytes, bytearray)):
+                continue
+            xy = _point_xy(bytes(p))
+            if xy:
+                f4_pts.append(xy)
+        if len(f4_pts) >= 2:
+            f6 = cf.get(6, [None])[0]
+            w_canvas = (float(f6) if isinstance(f6, float) and 0.05 < f6 < 200
+                        else _PEN_DEFAULT_WIDTH_PT)
+            origin = _stroke_origin(cf)
+            if origin is not None:
+                f4_pts = [(x + origin[0], y + origin[1]) for x, y in f4_pts]
+            # This layout keeps its points in #4, so _extract_color (which reads
+            # #4 as RGBA) is wrong here.  The stroke carries no per-point RGBA;
+            # its ink is the tool's stored colour, approximated as a dark gray.
+            fp_color = (0.30, 0.30, 0.30, 1.0)
+            return Stroke(points=[(x, y, w_canvas) for x, y in f4_pts],
+                          color=fp_color, kind="pen")
     if not pts:
         return None
     # flag-run / stride-8 strokes store no per-point width.  If the buffer
