@@ -493,7 +493,12 @@ def extract_pencil(raw: bytes) -> List[Tuple[float, float, float]]:
         # them without touching genuine points.
         if not (5.0 < x < 1600.0 and 5.0 < y < 1600.0):
             return None
-        if not (0.0 <= p < 3.0):
+        # A real pencil anchor always carries positive pressure (min ~0.046 in
+        # practice).  Reset / pen-lift sentinel records carry pressure ~0 (a
+        # subnormal float), e.g. a stray (58, 98) point; including one connects
+        # the stroke to it and draws a giant diagonal chord.  Require a
+        # minimum pressure to drop those sentinels.
+        if not (0.02 <= p < 3.0):
             return None
         return x, y, p
 
