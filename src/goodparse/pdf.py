@@ -123,6 +123,74 @@ def _font_name(bold: bool, italic: bool,
     return "/" + font_map.get((bold, italic), "F1")
 
 
+def _pdf_form_xobject(data: bytes) -> Optional[Tuple[float, float, bytes]]:
+    """Turn an embedded *vector PDF* (e.g. a GoodNotes sticker) into a Form
+    XObject body, returning ``(bbox_w, bbox_h, body)``.
+
+    GoodNotes stores die-cut stickers as small vector PDFs (``%PDF``), not
+    rasters.  ``_raster_to_jpeg`` can't decode them, so they were dropped and
+    the sticker never appeared.  We lift the page's content stream and re-emit
+    it as a self-contained Form XObject.  The only resource the content
+    references is an ICC colour space (``/Name cs``) set before each colour;
+    the colour values are plain 3-float RGB, so we strip those ``/Name cs``
+    operators and let the colours render in DeviceRGB (identical for flat
+    fills).  The die-cut (rounded) corners stay transparent because the
+    content never paints outside the rounded-rectangle path.
+    """
+    if not data or data[:4] != b"%PDF":
+        return None
+    try:
+        import re
+        txt = data.decode("latin-1")
+        # The *page* (singular) MediaBox, not the Pages tree's: locate the
+        # object whose dict says /Type /Page (a following space/char keeps it
+        # from matching /Pages) and read its MediaBox.
+        pw = ph = None
+        pg = re.search(r"/Type\s*/Page[^\w]", txt)
+        if pg:
+            seg = txt[pg.start():pg.start() + 400]
+            mb = re.search(r"/MediaBox\s*\[\s*0\s+0\s+([\d.]+)\s+([\d.]+)\s*\]",
+                           seg)
+            if mb:
+                pw, ph = float(mb.group(1)), float(mb.group(2))
+        # The content stream of the (first) page: the object referenced by the
+        # page's /Contents.  GoodNotes stickers have exactly one stream object.
+        sm = re.search(rb"stream\r?\n(.*?)\r?\nendstream", data, re.S)
+        if not sm:
+            return None
+        raw_cs = sm.group(1)
+        try:
+            content = zlib.decompress(raw_cs)
+        except Exception:
+            content = raw_cs
+        if not content.strip():
+            return None
+        if pw is None or ph is None:
+            pw, ph = 254.0, 214.0
+        bw, bh = pw, ph
+        # The content references a colour space by name (e.g. "/Cs1 cs") and
+        # sets flat 3-float colours with "sc".  With no colour space in the
+        # form's resources, Skia defaults to DeviceGray and keeps only the
+        # first component (green -> gray).  Map every colour-space name the
+        # content uses to /DeviceRGB: the stored RGB values already equal the
+        # reference output (the source ICC profile is sRGB-equivalent), so
+        # DeviceRGB reproduces the sticker's exact colours.
+        cs_names = set(re.findall(rb"/([A-Za-z0-9_]+)\s+(?:cs|CS)\b", content))
+        if cs_names:
+            cs_res = " ".join(
+                f"/{n.decode('latin-1')} /DeviceRGB" for n in cs_names)
+            resources = f" /Resources << /ColorSpace << {cs_res} >> >>"
+        else:
+            resources = " /Resources << /ColorSpace << /Cs1 /DeviceRGB >> >>"
+        body = (f"<< /Type /XObject /Subtype /Form /BBox [0 0 "
+                f"{_num(bw, 2)} {_num(bh, 2)}]{resources} /Length "
+                f"{len(content)} >>\nstream\n"
+                .encode("latin-1") + content + b"\nendstream")
+        return bw, bh, body
+    except Exception:
+        return None
+
+
 def _raster_to_jpeg(data: bytes, place_w: float = 0.0,
                     place_h: float = 0.0) -> Optional[Tuple[int, int, bytes]]:
     """Decode an embedded raster (PNG/JPEG) and re-encode it as RGB JPEG.
@@ -298,21 +366,37 @@ def _page_content(page, width_scale: float, alpha_name: Dict[float, str],
             xrefs.append(f"/ImBg {num} 0 R")
             out.append(f"q {_num(page.width, 2)} 0 0 {_num(h, 2)} 0 0 cm /ImBg Do Q")
 
-    # --- embedded photos ---------------------------------------------------- #
+    # --- embedded photos / vector stickers --------------------------------- #
     if _has_raster():
         for img in page.images:
+            px = img.position[0] * s
+            pw = img.size[0] * s
+            ph = img.size[1] * s
+            ypdf = h - (img.position[1] + img.size[1]) * s
+            name = f"Im{len(xrefs)}"
+            # Vector PDF sticker (die-cut): embed as a Form XObject so its
+            # vectors and transparent rounded corners survive (a JPEG would
+            # fill the corners with white over the grid).
+            form = _pdf_form_xobject(img.data)
+            if form is not None:
+                bw, bh, body = form
+                num = take_num()
+                img_bodies[num] = body
+                xrefs.append(f"/{name} {num} 0 R")
+                # A Form XObject uses its BBox (bw x bh) as its own coordinate
+                # space (unlike an Image XObject, which is always the unit
+                # square).  So scale BBox -> placement box (pw x ph), not by
+                # pw/ph directly.
+                out.append(f"q {_num(pw / bw, 4)} 0 0 {_num(ph / bh, 4)} "
+                           f"{_num(px, 2)} {_num(ypdf, 2)} cm /{name} Do Q")
+                continue
             rj = _raster_to_jpeg(img.data, img.size[0], img.size[1])
             if not rj:
                 continue
             w, hh, jpg = rj
             num = take_num()
             img_bodies[num] = _image_obj(w, hh, jpg)
-            name = f"Im{len(xrefs)}"
             xrefs.append(f"/{name} {num} 0 R")
-            px = img.position[0] * s
-            pw = img.size[0] * s
-            ph = img.size[1] * s
-            ypdf = h - (img.position[1] + img.size[1]) * s
             out.append(f"q {_num(pw, 2)} 0 0 {_num(ph, 2)} "
                        f"{_num(px, 2)} {_num(ypdf, 2)} cm /{name} Do Q")
 
