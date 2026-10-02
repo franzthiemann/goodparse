@@ -86,6 +86,16 @@ _PEN_DEFAULT_WIDTH_PT = 20.0
 # or colored tape (not gray), which keep the thick default on purpose.
 _PENCIL_DEFAULT_WIDTH_PT = 4.0
 
+# Pencil strokes are pressure-sensitive: each stride-12 record stores
+# (x, y, pressure) where pressure (third float) is a 0..~1 per-point value.
+# GoodNotes renders the pencil width proportional to pressure.  Measured
+# against the reference (gray word strokes ~0.8-1.2 pt), the mapping
+#   width_canvas = _PENCIL_PRESSURE_GAIN * pressure
+# reproduces the reference stroke weight (median pressure ~0.45 -> ~4 canvas
+# units -> ~2.2 pt page).  A floor keeps the lightest taps visible.
+_PENCIL_PRESSURE_GAIN = 9.0
+_PENCIL_MIN_PRESSURE = 0.10
+
 # Vector shapes (line / oval / triangle / polygon) draw as crisp ~5 pt black
 # outlines in the reference.  Their widthless default is _PEN_DEFAULT_WIDTH_PT
 # (10.91 pt), which is ~2x too heavy: a fat black ring anti-aliases into a soft
@@ -452,6 +462,65 @@ def extract_curve(raw: bytes) -> List[Tuple[float, float]]:
     return pts
 
 
+def extract_pencil(raw: bytes) -> List[Tuple[float, float, float]]:
+    """Extract a pressure-sensitive *pencil* path from its geometry blob.
+
+    The pencil stores stride-12 records ``(x, y, pressure)`` — the third float
+    is the per-point pressure, i.e. the per-point width (the pencil is
+    pressure-sensitive, unlike the uniform-width highlighter).  Real anchor
+    points sit at a fixed phase and have plausible canvas coordinates
+    (``1 < x, y``); the interleaved control / Bézier-handle records carry
+    ``x < 1`` or ``y < 1`` and are skipped.  ``extract_curve`` (stride-20) and
+    ``extract_points`` both mis-read this layout (they read the wrong floats /
+    break at the control records), returning only a few far-apart points that
+    the emitter connects into giant chords.  We instead scan for contiguous
+    runs of valid stride-12 anchors and return ``(x, y, pressure)`` triples in
+    drawing order.
+    """
+    n = len(raw)
+    if n < 24:
+        return []
+
+    def anchor(o: int) -> Optional[Tuple[float, float, float]]:
+        if o + _POINT_STRIDE > n:
+            return None
+        x, y, p = _f32(raw, o), _f32(raw, o + 4), _f32(raw, o + 8)
+        # Real anchors sit well inside the canvas.  The stride-12 array also
+        # carries spurious pen-state / reset records with tiny near-origin
+        # coordinates (x, y ~ 1-3); letting those through connects the stroke
+        # to the top-left corner and draws a giant chord.  A floor of 5 (the
+        # canvas corner is off-page, so no real anchor ever lands there) drops
+        # them without touching genuine points.
+        if not (5.0 < x < 1600.0 and 5.0 < y < 1600.0):
+            return None
+        if not (0.0 <= p < 3.0):
+            return None
+        return x, y, p
+
+    pts: List[Tuple[float, float, float]] = []
+    s = 0
+    while s + _POINT_STRIDE <= n:
+        a = anchor(s)
+        if a is None:
+            s += 1
+            continue
+        e = s
+        while anchor(e) is not None:
+            e += _POINT_STRIDE
+        for i in range((e - s) // _POINT_STRIDE):
+            a = anchor(s + i * _POINT_STRIDE)
+            if a is not None:
+                pts.append(a)
+        s = e
+    if len(pts) < 2:
+        return []
+    xs = [p[0] for p in pts]
+    ys = [p[1] for p in pts]
+    if (max(xs) - min(xs)) < 0.5 and (max(ys) - min(ys)) < 0.5:
+        return []  # degenerate (all-zero placeholder)
+    return pts
+
+
 def _stroke_origin(content_fields) -> Optional[Tuple[float, float]]:
     """Read the stroke's origin/anchor offset from field ``#6``.
 
@@ -804,13 +873,25 @@ def _parse_stroke(cf, scale: float = 1.0) -> Optional[Stroke]:
     color = _extract_color(cf)
     tool_id = cf.get(21, [None])[0]
 
-    if tool_id == 25:
-        pts = extract_curve(raw)
-        if not pts:
-            return None
-        w = _HL_DEFAULT_WIDTH_PT
-        return Stroke(points=[(x, y, w) for x, y in pts], color=color,
-                      kind="highlighter")
+    if tool_id == 25 and raw is not None:
+        # Pencil: dense pressure-sensitive stride-12 (x, y, pressure) records.
+        # The third float is the per-point pressure -> per-point width.
+        ppts = extract_pencil(raw)
+        if not ppts:
+            # Fall back to the legacy highlighter/curve layout (some builds).
+            pts = extract_curve(raw)
+            if not pts:
+                return None
+            w = _HL_DEFAULT_WIDTH_PT
+            return Stroke(points=[(x, y, w) for x, y in pts], color=color,
+                          kind="highlighter")
+        # pressure (0..~1) -> canvas-unit width; store so the emitter ×scale.
+        per_pt = []
+        for x, y, p in ppts:
+            w = max(_PENCIL_PRESSURE_GAIN * p,
+                    _PENCIL_PRESSURE_GAIN * _PENCIL_MIN_PRESSURE)
+            per_pt.append((x, y, w))
+        return Stroke(points=per_pt, color=color, kind="pen")
 
     pts = extract_points(raw) if raw is not None else []
     # Fountain-pen / pressure strokes in the latest build carry their points as
