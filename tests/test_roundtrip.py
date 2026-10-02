@@ -89,9 +89,9 @@ def test_test4_thick_pens_detected():
     strokes = {color_to_hex(s.color): s for p in doc.pages for s in p.strokes}
     blue_w = max(w for _x, _y, w in strokes["#007affff"].points)
     red_w = max(w for _x, _y, w in strokes["#d20000ff"].points)
-    assert blue_w > 2.0          # thick pen
-    assert red_w < 1.5           # thin pen
-    assert blue_w > red_w * 2
+    assert blue_w > 4.0          # thick pen (diameter; ref ~7.25pt on page)
+    assert red_w < 3.0           # thin pen  (diameter; ref ~2.5pt on page)
+    assert blue_w > red_w * 2    # blue is clearly the thick pen
 
 
 # --------------------------------------------------------------------------- #

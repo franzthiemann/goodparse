@@ -382,6 +382,29 @@ def _earliest_stride12(raw: bytes) -> Tuple[int, int]:
     return 0, 0
 
 
+def _is_coherent(pts: List[Tuple[float, float, float]],
+                 max_median_jump: float = 40.0) -> bool:
+    """Reject a decoded path whose points are not spatially coherent.
+
+    A genuine pen/marker stroke is continuous: the median distance between
+    consecutive points is small (measured <= 14 canvas units across the
+    samples).  A *mis-decoded* blob (a template / wrong-phase buffer read as a
+    path) yields points that teleport around the page — the Test9 stroke i=108
+    has a median consecutive jump of ~712 units and paints a giant smudge.
+    Threshold of 40 sits comfortably above every real stroke (~14) and far
+    below a garbage path (~700).
+    """
+    if len(pts) < 8:
+        return True
+    jumps = []
+    for i in range(1, len(pts)):
+        dx = pts[i][0] - pts[i - 1][0]
+        dy = pts[i][1] - pts[i - 1][1]
+        jumps.append((dx * dx + dy * dy) ** 0.5)
+    jumps.sort()
+    return jumps[len(jumps) // 2] <= max_median_jump
+
+
 def extract_points(raw: bytes) -> List[Tuple[float, float, float]]:
     """Extract the stroke path from decompressed pen geometry.
 
@@ -399,9 +422,37 @@ def extract_points(raw: bytes) -> List[Tuple[float, float, float]]:
     """
     s12, c12 = _earliest_stride12(raw)
     if c12 >= 2 and _stride12_widths_ok(raw, s12, c12):
-        return [(_f32(raw, s12 + i * 12),
-                 _f32(raw, s12 + i * 12 + 4),
-                 _f32(raw, s12 + i * 12 + 8)) for i in range(c12)]
+        # A stride-12 pen/marker stores (x, y, width) records, but interleaves
+        # control / pen-up records every third slot, so a *contiguous* run is
+        # short even when the real path is long.  Read every stride-12 record
+        # at the anchor's phase and keep the valid ones, skipping the control
+        # records (this is what reconstructs the full red-tape band that
+        # ``_earliest_stride12``'s contiguous count would truncate to a dot).
+        pts: List[Tuple[float, float, float]] = []
+        bad = 0
+        o = s12
+        while o + _POINT_STRIDE <= len(raw):
+            # A real stride-12 record has plausible coordinates AND a plausible
+            # width.  The width gate matters: past the real path the phase
+            # mis-aligns and the *y* lands in the width slot (reads 30..200),
+            # so a width bound of 10 (matching ``_stride12_widths_ok``) both
+            # bridges the interleaved control records and stops before the junk.
+            w = _f32(raw, o + 8)
+            if _valid_point(raw, o) and 0.0 <= w <= 10.0:
+                # The stored per-point value is a half-width (radius): the
+                # reference marker/pen band is 2.00x the width that w*scale
+                # produces (e.g. the red tape stores 9.0 -> 4.91pt, but the
+                # reference renders it at 9.83pt).  Store the diameter so the
+                # emitter (w * scale) yields the true ink thickness.
+                pts.append((_f32(raw, o), _f32(raw, o + 4), w * 2.0))
+                bad = 0
+            else:
+                bad += 1
+                if bad > 3:  # control records appear at most every 3rd slot
+                    break
+            o += _POINT_STRIDE
+        if len(pts) >= 2:
+            return pts
     # No valid stride-12 pen.  A genuine flag-run is identified by a buffer
     # length that is a whole multiple of the per-record stride (8 or 16 bytes)
     # times the stored count, or by a count too small to fill the buffer
@@ -899,6 +950,12 @@ def _parse_stroke(cf, scale: float = 1.0) -> Optional[Stroke]:
         return Stroke(points=per_pt, color=color, kind="pen")
 
     pts = extract_points(raw) if raw is not None else []
+    # A blob that decodes into a spatially incoherent scatter (points teleport
+    # hundreds of units between consecutive samples) is a mis-read template,
+    # not a real stroke — e.g. Test9 i=108, which paints a giant page-spanning
+    # smudge.  Drop it rather than emit the artifact.
+    if pts and not _is_coherent(pts):
+        return None
     # Fountain-pen / pressure strokes in the latest build carry their points as
     # repeated field-#4 point messages ({1: x, 2: y}, no per-point width) rather
     # than an LZ4 blob.  A single uniform width float lives in field #6.  Only
