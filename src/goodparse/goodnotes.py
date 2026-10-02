@@ -48,7 +48,7 @@ from .protobuf import (
     parse_message,
     read_length_delimited_records,
 )
-from .text_rtf import TextLine, parse_rtf_runs
+from .text_rtf import TextLine, TextRun, parse_rtf_runs
 
 # A4 in PDF points (72 dpi) — fallback for documents without an explicit page
 # size (samples 1-4 are A4).
@@ -167,6 +167,10 @@ class TextBox:
     plain: str
     color: Tuple[float, float, float, float] = (0.0, 0.0, 0.0, 1.0)
     lines: List["TextLine"] = field(default_factory=list)
+    # Field-21 sticker text carries an explicit *canvas*-unit size (still
+    # scaled by ``s`` at emit time).  0 = not present -> the emitter falls back
+    # to guessing the size from the RTF (the field-8 text-box path).
+    font_size: float = 0.0
 
 
 @dataclass
@@ -810,6 +814,140 @@ def _matrix_from(msg: bytes) -> Optional[Tuple[Tuple[float, float], Tuple[float,
     return None
 
 
+def _printable_text(b: bytes) -> bool:
+    """True if ``b`` looks like a real text string (printable + alphabetic)."""
+    if not b or len(b) > 200:
+        return False
+    return (sum(32 <= c < 127 for c in b) > len(b) * 0.5
+            and any(chr(c).isalpha() for c in b))
+
+
+def _field21_color(sub: bytes) -> Optional[Tuple[float, float, float, float]]:
+    """Read a colour from a GoodNotes run-style colour sub-block.
+
+    The block opens with the R float (field 1, tag ``0d``) and, when the
+    following floats are non-degenerate, the G/B/A floats (fields 2/3/4, tags
+    ``15``/``1d``/``25``) at fixed offsets.  A near-zero G or B float corrupts
+    the tag bytes, so the position check is trusted only when it holds;
+    otherwise the colour is a single-channel swatch and R is treated as a
+    grayscale value (the reference renders those neutral gray).
+    """
+    if len(sub) < 9 or sub[0] != 0x0d:
+        return None
+    r = struct.unpack_from("<f", sub, 1)[0]
+    if not 0.0 <= r <= 1.0:
+        return None
+    if (len(sub) >= 20 and sub[5] == 0x15 and sub[10] == 0x1d
+            and sub[15] == 0x25):
+        g = struct.unpack_from("<f", sub, 6)[0]
+        b = struct.unpack_from("<f", sub, 11)[0]
+        a = struct.unpack_from("<f", sub, 16)[0]
+        if all(0.0 <= c <= 1.0 for c in (g, b, a)):
+            if g == 0.0 and b == 0.0 and r > 0.0:  # grayscale swatch
+                r = g = b = r
+            return (r, g, b, a)
+    return (r, r, r, 1.0)
+
+
+def _decode_field21_text(f32b: bytes) -> Optional[Dict[str, object]]:
+    """Decode a field-#21 sticker/text object's ``f32`` run blob.
+
+    The blob opens with a ``bv41`` magic then a Cocoa text-run message.  A flat
+    scan of the post-magic bytes is more robust than navigating the nesting,
+    which varies per run.  Returns ``{"text", "size", "color"}`` (size in
+    canvas units, colour RGBA 0..1) or ``None`` if no readable text is found.
+    """
+    off = f32b.find(b"bv41")
+    if off < 0:
+        return None
+    body = f32b[off + 4:]
+    text: Optional[str] = None
+    size: Optional[float] = None
+    color: Optional[Tuple[float, float, float, float]] = None
+    family: Optional[str] = None
+    # text: 0a <len> <printable>
+    for m in re.finditer(rb"\x0a", body):
+        o = m.start()
+        if o + 2 > len(body):
+            continue
+        ln = body[o + 1]
+        sub = body[o + 2:o + 2 + ln]
+        if _printable_text(sub):
+            text = sub.decode("utf-8", "replace")
+            break
+    if text is None:
+        return None
+    # size: field 40, wire-5 (tag 0xc5 0x02) followed by a 4-byte f32
+    for m in re.finditer(rb"\xc5\x02", body):
+        o = m.end()
+        if o + 4 <= len(body):
+            v = struct.unpack_from("<f", body, o)[0]
+            if 8.0 <= v <= 120.0:
+                size = v if size is None else max(size, v)
+    # colour: 0x1a <len> <RGBA block>
+    for m in re.finditer(rb"\x1a", body):
+        o = m.start()
+        if o + 2 > len(body):
+            continue
+        ln = body[o + 1]
+        if 16 <= ln <= 26:
+            c = _field21_color(body[o + 2:o + 2 + ln])
+            if c is not None:
+                color = c
+                break
+    # family: the run style stores the font name as an ASCII field (30).
+    family = _field21_family(body)
+    return {"text": text, "size": size, "color": color, "family": family}
+
+
+# Font family names GoodNotes writes into run styles (used to locate the
+# family string in the blob; also what the embedded-font matcher keys off).
+_KNOWN_FAMILIES = (
+    "Futura PT", "Futura", "Avenir Next", "Avenir", "Helvetica Neue",
+    "Helvetica", "Georgia", "Baskerville", "Didot", "Optima", "Gill Sans",
+    "Rockwell", "Century Gothic", "Palatino Linotype", "Palatino", "Bodoni 72",
+    "Snell Roundhand", "Cochin", "Copperplate", "Papyrus", "Courier New",
+    "Times New Roman", "Aptos", "Montserrat", "Open Sans",
+)
+
+
+def _field21_family(body: bytes) -> Optional[str]:
+    """Return the font family name stored in a run's style, or ``None``."""
+    # The style field is ``0x1a <len>`` (field 3, wire-2); its font name is a
+    # nested ASCII field.  Scan that sub-block for a known family.
+    for m in re.finditer(rb"\x1a", body):
+        o = m.start()
+        if o + 2 > len(body):
+            continue
+        ln = body[o + 1]
+        if not (8 <= ln <= 40):
+            continue
+        sub = body[o + 2:o + 2 + ln]
+        for fam in _KNOWN_FAMILIES:
+            if fam.encode("ascii") in sub:
+                return fam
+    # Fallback: any known family anywhere in the body (the run may nest it).
+    for fam in _KNOWN_FAMILIES:
+        if fam.encode("ascii") in body:
+            return fam
+    return None
+
+
+def _field21_position(f21: bytes) -> Optional[Tuple[float, float]]:
+    """Top-left placement of a field-#21 text object, in canvas space.
+
+    The object transform is ``f21.f20``; its first point (``f20.f1``) is the
+    origin.  Returns ``(x, y)`` or ``None``.
+    """
+    f20 = _get_blob(f21, 20)
+    if not f20:
+        return None
+    p1 = _get_blob(f20, 1)
+    if not p1:
+        return None
+    return _point_xy(p1)
+
+
 def _raster_format(data: bytes) -> str:
     if data[:8] == b"\x89PNG\r\n\x1a\n":
         return "png"
@@ -1100,6 +1238,39 @@ def parse_page(data: bytes, attachments: Dict[str, bytes],
                         rtf=bytes(rtf).decode("cp1252", "replace"),
                         plain=plain, color=color, lines=lines,
                     ))
+        # sticker text: top-level record with field #21 (Cocoa text run,
+        # ``bv41`` blob).  Unlike field-#8 boxes there is no RTF; the text,
+        # size (page points) and colour live in the run blob.
+        for f21 in top.get(21, []):
+            if not isinstance(f21, (bytes, bytearray)):
+                continue
+            f21 = bytes(f21)
+            pos = _field21_position(f21)
+            if not pos:
+                continue
+            f32 = _get_blob(f21, 32)
+            if not f32:
+                continue
+            dec = _decode_field21_text(bytes(f32))
+            if not dec or not dec["text"]:
+                continue
+            raw_color = dec["color"]
+            color: Tuple[float, float, float, float] = (
+                (raw_color
+                 if isinstance(raw_color, tuple) else (0.0, 0.0, 0.0, 1.0)))
+            raw_size = dec["size"]
+            size_pt = float(raw_size) if isinstance(raw_size, float) else 0.0
+            raw_fam = dec.get("family")
+            family = raw_fam if isinstance(raw_fam, str) else None
+            plain = str(dec["text"]).strip()
+            page.texts.append(TextBox(
+                position=pos, size=(1.0, 1.0),
+                rtf="", plain=plain, color=color,
+                lines=[TextLine(runs=[TextRun(
+                    text=plain, bold=True, color=color,
+                    font_family=family)])],
+                font_size=size_pt,
+            ))
 
     # second pass: match images to their companion matrix records
     for rec in recs:

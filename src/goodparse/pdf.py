@@ -41,6 +41,13 @@ try:
     from PIL import Image as _PILImage
 except Exception:  # pragma: no cover - depends on install
     _PILImage = None
+# Optional font embedding (needs fontTools).  The module imports cleanly even
+# without fontTools; it only returns None / falls back then.  Kept optional so
+# the core library stays importable with zero third-party packages.
+try:
+    from . import font_embed as _font_embed
+except Exception:  # pragma: no cover - depends on install
+    _font_embed = None
 
 CREATOR = "goodparse"
 
@@ -77,7 +84,14 @@ def _pdf_escape(s: str) -> str:
 
 
 def _text_font_size(t: TextBox) -> float:
-    """Guess the box's canvas-space point size from its RTF (``\\fs`` half-pts)."""
+    """Canvas-space point size of a text box.
+
+    Field-21 sticker text stores an explicit canvas-unit size (``font_size``
+    — still scaled by ``s`` at emit time); RTF boxes fall back to guessing from
+    ``\\fs``.
+    """
+    if t.font_size > 0:
+        return t.font_size
     m = re.search(r"\\fs(\d+)", t.rtf)
     if m:
         return int(m.group(1)) / 2.0
@@ -248,7 +262,8 @@ def _image_obj(w: int, h: int, jpg: bytes) -> bytes:
 
 
 def _emit_text(parts: List[str], t: TextBox, s: float, h: float,
-               font_map: Dict[Tuple[bool, bool], str]) -> None:
+               font_map: Dict[Tuple[bool, bool], str],
+               embed_map: Optional[Dict] = None) -> None:
     """Append ``Tj``/line ops for a text box (top-left origin -> PDF).
 
     Each styled run is emitted with its own font (``/F1``.. = plain,
@@ -256,11 +271,21 @@ def _emit_text(parts: List[str], t: TextBox, s: float, h: float,
     lines positioned under/through the run using the Helvetica advance widths.
     Runs are reflowed word-by-word so they wrap to the box width (matching the
     reference, which wraps a long line) instead of overflowing the page.
+
+    When a run names a font family whose clone is installed (and fontTools is
+    available), it is emitted with an embedded subset font using 2-byte
+    glyph-ID codes (``<hex>``) and the font's real advance widths, so the
+    glyphs match the original.  Runs whose family isn't installed keep the
+    base-14 Helvetica path.
     """
+    # Field-21 sticker text stores its size in *canvas* units (like every other
+    # box) so it flows through the same canvas→page scale ``s``; the size is
+    # explicit so ``_text_font_size`` returns it directly.  It is a single
+    # unbreakable line (no real box width) so it must never wrap.
     fs = _text_font_size(t) * s
     x0 = t.position[0] * s
     top = t.position[1] * s
-    box_w = max(fs * 0.5, t.size[0] * s)
+    box_w = float("inf") if t.font_size > 0 else max(fs * 0.5, t.size[0] * s)
     leading = fs * 1.2
 
     lines = t.lines if t.lines else [SimpleNamespace(
@@ -275,20 +300,36 @@ def _emit_text(parts: List[str], t: TextBox, s: float, h: float,
         for run in line.runs:
             if not run.text:
                 continue
+            fam = getattr(run, "font_family", None)
             for w in run.text.split(" "):
                 if not w:
                     continue
                 tokens.append(SimpleNamespace(
                     text=w, bold=run.bold, italic=run.italic,
                     underline=run.underline, strike=run.strike,
-                    color=run.color))
+                    color=run.color, font_family=fam))
+
+    def _tok_embed(tok):
+        """Embedded font (``(res, ef)``) for a token, or ``None`` if base-14."""
+        if embed_map and tok.font_family:
+            ent = embed_map.get((tok.font_family, bool(tok.bold),
+                                 bool(tok.italic)))
+            if ent:
+                return ent[0], ent[1]
+        return None
+
+    def _tok_width(tok, seg: str) -> float:
+        e = _tok_embed(tok)
+        if e:
+            return e[1].width(seg) / 1000.0 * fs
+        return _run_width(seg, fs)
 
     # Greedy word wrap across visual lines.
     vlines: List[List] = [[]]
     used = 0.0
     for tok in tokens:
-        w = _run_width(tok.text, fs)
-        space = _run_width(" ", fs)
+        w = _tok_width(tok, tok.text)
+        space = _tok_width(tok, " ")
         add = w + (space if vlines[-1] else 0.0)
         if vlines[-1] and used + add > box_w and used > 0:
             vlines.append([tok])
@@ -304,15 +345,26 @@ def _emit_text(parts: List[str], t: TextBox, s: float, h: float,
         cursor = x0
         for k, tok in enumerate(vline):
             r, g, b, _a = tok.color
-            fname = _font_name(bool(tok.bold), bool(tok.italic), font_map)
             seg = tok.text
             if k < len(vline) - 1:
                 seg += " "
             parts.append(f"{_num(r)} {_num(g)} {_num(b)} rg")
-            parts.append(f"{fname} {fs:.2f} Tf")
-            parts.append(
-                f"BT {cursor:.2f} {baseline:.2f} Td ({_pdf_escape(seg)}) Tj ET")
-            w = _run_width(seg, fs)
+            emb = _tok_embed(tok)
+            if emb is not None:
+                # Embedded subset font: 2-byte glyph-ID codes in a <hex>
+                # string; advance comes from the font's real widths.
+                fname, ef = emb
+                hexcodes = ef.code(seg).hex()
+                parts.append(f"{fname} {fs:.2f} Tf")
+                parts.append(
+                    f"BT {cursor:.2f} {baseline:.2f} Td <{hexcodes}> Tj ET")
+                w = ef.width(seg) / 1000.0 * fs
+            else:
+                fname = _font_name(bool(tok.bold), bool(tok.italic), font_map)
+                parts.append(f"{fname} {fs:.2f} Tf")
+                parts.append(
+                    f"BT {cursor:.2f} {baseline:.2f} Td ({_pdf_escape(seg)}) Tj ET")
+                w = _run_width(seg, fs)
             if tok.underline:
                 uy = baseline - fs * 0.12
                 parts.append(f"{_num(r)} {_num(g)} {_num(b)} RG")
@@ -330,9 +382,9 @@ def _emit_text(parts: List[str], t: TextBox, s: float, h: float,
 
 def _page_content(page, width_scale: float, alpha_name: Dict[float, str],
                   has_font: bool, next_num: int,
-                  font_map: Dict[Tuple[bool, bool], str]) -> Tuple[str,
-                                                          List[str],
-                                                          Dict[int, bytes]]:
+                  font_map: Dict[Tuple[bool, bool], str],
+                  embed_map: Optional[Dict] = None
+                  ) -> Tuple[str, List[str], Dict[int, bytes]]:
     """Build a page's content stream plus its image XObject objects.
 
     Returns ``(content_text, xobject_refs, image_bodies)`` where ``xobject_refs``
@@ -457,7 +509,7 @@ def _page_content(page, width_scale: float, alpha_name: Dict[float, str],
     # --- text --------------------------------------------------------------- #
     if has_font:
         for t in page.texts:
-            _emit_text(out, t, s, h, font_map)
+            _emit_text(out, t, s, h, font_map, embed_map)
 
     return "\n".join(out) + "\n", xrefs, img_bodies
 
@@ -503,6 +555,40 @@ def build_pdf(doc: GoodNotesDocument, width_scale: float = 1.0) -> bytes:
                 sorted(used, key=lambda b: (b[0], b[1]))):
             font_map[(bold, italic)] = f"F{fi + 1}"
         next_free += len(font_map)
+    # Optional embedded fonts: for any run that names a non-base-14 family
+    # (e.g. "Futura") whose clone is installed, subset it and embed it so the
+    # glyphs match.  Each (family, bold, italic) group gets 5 objects (Type0,
+    # CIDFontType0C, FontDescriptor, FontFile3, ToUnicode).  With no matching
+    # font (or no fontTools) this stays empty and base-14 Helvetica is used.
+    embed_map: Dict[Tuple[str, bool, bool], Tuple[str, "object", int]] = {}
+    embed_objs: Dict[int, bytes] = {}
+    if _font_embed is not None and _font_embed.fonttools_available():
+        groups: Dict[Tuple[str, bool, bool], str] = {}
+        for page in pages:
+            for t in page.texts:
+                for ln in (t.lines or []):
+                    for r in ln.runs:
+                        fam = getattr(r, "font_family", None)
+                        if not fam:
+                            continue
+                        key = (fam, bool(r.bold), bool(r.italic))
+                        # Always include a space so multi-word segments can
+                        # code the trailing space added at emission.
+                        groups[key] = groups.get(key, " ") + (r.text or "")
+        for key, text in sorted(groups.items()):
+            fam, bold, italic = key
+            path = _font_embed.find_font_file(fam, bold, italic)
+            if not path:
+                continue
+            ef = _font_embed.subset_and_embed(path, text, "GP")
+            if ef is None:
+                continue
+            res = "EF%d" % (len(embed_map) + 1)
+            base_obj = next_free
+            for num, b in _font_embed.build_font_objects(base_obj, ef).items():
+                embed_objs[num] = b
+            embed_map[key] = (res, ef, base_obj)
+            next_free += 5
     img_base = next_free                     # image objects numbered from here
 
     bodies: Dict[int, bytes] = {
@@ -521,15 +607,18 @@ def build_pdf(doc: GoodNotesDocument, width_scale: float = 1.0) -> bytes:
                 + _base[(bold, italic)].encode()
                 + b" /Encoding /WinAnsiEncoding >>")
 
+    for num, payload in embed_objs.items():
+        bodies[num] = payload
     img_counter = img_base
     for i, page in enumerate(pages):
         content, xrefs, img_bodies = _page_content(
-            page, width_scale, alpha_name, has_font, img_counter, font_map)
+            page, width_scale, alpha_name, has_font, img_counter,
+            font_map, embed_map)
         img_counter += len(img_bodies)
         for num, payload in img_bodies.items():
             bodies[num] = payload
 
-        stream = content.encode("latin-1")
+        stream = content.encode("cp1252", "replace")
         compressed = zlib.compress(stream)
         bodies[content_obj(i)] = (
             f"<< /Length {len(compressed)} /Filter /FlateDecode >>\nstream\n".encode()
@@ -542,6 +631,10 @@ def build_pdf(doc: GoodNotesDocument, width_scale: float = 1.0) -> bytes:
             font_refs = " ".join(
                 f"/{fname} {font_obj + fi} 0 R"
                 for fi, ((bold, italic), fname) in enumerate(font_map.items()))
+            if embed_map:
+                font_refs += " " + " ".join(
+                    f"/{res} {base_obj} 0 R"
+                    for res, _ef, base_obj in embed_map.values())
             res_parts.append(f"/Font << {font_refs} >>")
         if alphas:
             res_parts.append("/ExtGState << " +

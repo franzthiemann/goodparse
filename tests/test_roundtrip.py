@@ -413,3 +413,65 @@ def test_pdf_stroke_only_still_valid_without_raster(tmp_path, monkeypatch):
     assert b"/DCTDecode" not in data
     assert b"/ImBg" not in data
     assert b"/F1" in data              # text font still present
+
+
+# --------------------------------------------------------------------------- #
+# Optional embedded fonts (Futura / Helvetica Neue -> installed clone)
+# --------------------------------------------------------------------------- #
+
+def _f21_families():
+    """The font family names captured for Test9's sticker text, or []."""
+    doc = parse_goodnotes(sample("Test9.goodnotes"))
+    fams = set()
+    for p in doc.pages:
+        for t in p.texts:
+            for ln in (t.lines or []):
+                for r in ln.runs:
+                    if getattr(r, "font_family", None):
+                        fams.add(r.font_family)
+    return fams
+
+
+def test_field21_families_captured():
+    # Test9's sticker text names Futura (FRIENDS/SUCH/GOOD) and Helvetica
+    # Neue (Hallo); the parser must capture the family on each run.
+    fams = _f21_families()
+    assert "Futura" in fams
+    assert "Helvetica Neue" in fams
+
+
+def test_embedded_font_present_when_clone_installed(tmp_path):
+    import goodparse.font_embed as fe
+    if not fe.fonttools_available():
+        pytest.skip("fontTools not installed")
+    if fe.find_font_file("Futura", True, False) is None:
+        pytest.skip("no Futura clone (URW Gothic) installed")
+    out = convert_file(sample("Test9.goodnotes"), str(tmp_path / "out.pdf"))
+    data = open(out, "rb").read()
+    # embedded CFF fonts use /FontFile3 + a CIDFontType0C descendant and a
+    # 2-byte hex string in the content stream; the base-14 fallback stays too
+    assert data.count(b"/FontFile3") >= 1
+    assert b"/CIDFontType0C" in data
+    assert b"/Identity-H" in data
+    # every embedded font must have a ToUnicode map (searchable/selectable)
+    assert data.count(b"/ToUnicode") == data.count(b"/FontFile3")
+    # the xref still stays self-consistent with the extra objects
+    entries, size, _ = _xref_offsets(data)
+    assert size == 1 + len(_objects(data))
+
+
+def test_embedded_font_falls_back_to_base14_without_fonts(tmp_path, monkeypatch):
+    import goodparse.font_embed as fe
+    import goodparse.pdf as pdf_mod
+    if not fe.fonttools_available():
+        pytest.skip("fontTools not installed")
+    # Force "no clone found" so the base-14 Helvetica path must be used.
+    monkeypatch.setattr(fe, "find_font_file", lambda *a, **k: None)
+    out = convert_file(sample("Test9.goodnotes"), str(tmp_path / "out.pdf"))
+    data = open(out, "rb").read()
+    # no embedded font objects, but the base-14 bold is still there for text
+    assert b"/FontFile3" not in data
+    assert b"/CIDFontType0C" not in data
+    assert b"/Helvetica-Bold" in data
+    entries, size, _ = _xref_offsets(data)
+    assert size == 1 + len(_objects(data))

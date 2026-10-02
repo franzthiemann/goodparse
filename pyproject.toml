@@ -31,6 +31,9 @@ goodnotes2xournal = "goodparse.cli:main"
 
 [project.optional-dependencies]
 test = ["pytest"]
+# Real-font embedding for PDF text (only used when the matching font is
+# installed on the system; the base-14 Helvetica fallback needs nothing).
+pdf-fonts = ["fontTools>=4.0"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

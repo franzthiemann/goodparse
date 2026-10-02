@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 
 @dataclass
@@ -27,6 +27,10 @@ class TextRun:
     underline: bool = False
     strike: bool = False
     color: Tuple[float, float, float, float] = (0.0, 0.0, 0.0, 1.0)
+    # Font family name (e.g. "Futura", "Helvetica Neue") when known, else None.
+    # Used only by the optional embedded-font path; the base-14 emitter
+    # ignores it.
+    font_family: Optional[str] = None
 
 
 @dataclass
