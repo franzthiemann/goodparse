@@ -160,7 +160,6 @@ class Page:
 class GoodNotesDocument:
     pages: List[Page] = field(default_factory=list)
     title: str = "GoodNotes"
-    canvas: Optional[Tuple[float, float]] = None  # (w, h) in points
 
 
 # --------------------------------------------------------------------------- #
@@ -531,113 +530,36 @@ def _read_page_order(opener, names, fallback) -> List[str]:
     return ordered
 
 
-def _read_page_backgrounds(opener, names) -> Dict[str, str]:
-    """Map page member UUID -> background paper attachment UUID.
+def _read_page_members(opener, names, attachments) -> List[Page]:
+    """Parse every live ``notes/<UUID>`` member in display order, keeping
+    empty pages (a page may hold only a background).
 
-    ``index.events.pb`` is an operation log.  A page is *created* by an op whose
-    field #1 is the page UUID and which carries field #54; a *paper* is applied
-    by an op whose field #1 is the paper (background PDF) UUID and which carries
-    field #105.  Creations and paper-assignments are interleaved in document
-    order, so we record both sequences and zip them: the i-th created page gets
-    the i-th assigned paper, and a page with no explicit assignment inherits the
-    most recent paper (a freshly created page keeps the current paper).  When the
-    events file is absent we return an empty mapping (no backgrounds).
-    """
-    if "index.events.pb" not in names:
-        return {}
-    member_names = _page_members(names)
-    try:
-        data = opener("index.events.pb")
-    except Exception:
-        return {}
-    creations: List[str] = []   # page UUIDs, creation order
-    papers: List[str] = []      # paper UUIDs, assignment order
-    for rec in read_length_delimited_records(data):
-        top = parse_message_tolerant(rec)
-        f1 = top.get(1, [None])[0]
-        if not isinstance(f1, (bytes, bytearray)):
-            continue
-        uuid = bytes(f1).decode("ascii", "ignore").strip()
-        if not uuid or uuid.count("-") != 4:
-            continue
-        fields = {k for k in top if k != 1}
-        if 54 in fields:
-            if uuid not in creations:
-                creations.append(uuid)
-        elif 105 in fields:
-            papers.append(uuid)
-    if not papers:
-        return {}
-    # NOTE: the page-creation ops store an *internal* page-object id that differs
-    # from the ``notes/`` member name by exactly one nibble in the final hex byte
-    # (e.g. ``...EC7A`` vs member ``...EC7B``).  The first 32 chars are identical,
-    # so we join on that prefix.
-    def p32(u):
-        return u[:32]
-
-    member_prefix = {p32(name.split("/")[-1]): name.split("/")[-1]
-                     for name in member_names}
-    bg: Dict[str, str] = {}
-    last = None
-    for i, created in enumerate(creations):
-        if i < len(papers):
-            last = papers[i]
-        if last:
-            member = member_prefix.get(p32(created))
-            if member:
-                bg[member] = last
-    return bg
-
-
-def _read_page_members(opener, names, attachments, canvas,
-                       page_size) -> List[Page]:
-    """Parse every ``notes/<UUID>`` member, in document order, keeping empty
-    pages (a page may hold only a background).
-
-    Per-page geometry (size + scale) is read from the event log: in current
-    GoodNotes builds each page has its own canvas (``f54`` -> layer ->
-    create-info ``f8``), so a single global page size is wrong for documents
-    mixing page sizes (A4 + landscape + strips).  Old builds, which carry no
-    such per-page canvas, fall back to the global ``canvas``/``page_size``.
+    Per-page geometry and paper come from the event log (see
+    :func:`_read_page_meta`): each page has its own canvas, so documents can
+    mix page sizes (A4 + landscape + strips).  A page the log does not
+    describe falls back to A4 at scale 1.
     """
     member_names = _page_members(names)
     meta = _read_page_meta(opener, names, member_names)
+    per_page = {m.split("/")[-1]: (c, p) for m, _layer, c, p in meta if m}
 
-    # bare-member-name (no "notes/" prefix) -> (canvas, paper)
-    per_page = {m.split("/")[-1]: (c, p) for m, _p, c, p in meta}
-
-    order: List[str] = []
-    if meta:
-        for m, _layer, _c, _p in meta:
-            if m and m not in order:
-                order.append(m)
-    for m in _read_page_order(opener, names, member_names):  # defensive fill
+    order: List[str] = [m for m, _l, _c, _p in meta if m]
+    for m in _read_page_order(opener, names, member_names):  # pages not in the log
         if m not in order:
             order.append(m)
 
-    bg_map = _read_page_backgrounds(opener, names)
     deleted = set(_read_deleted_pages(opener, names))
     paper_att = _read_paper_to_attachment(opener, names)
-
-    def resolve_paper(paper):
-        if not paper:
-            return None
-        # a paper UUID may be an internal id; map to its real attachment
-        return paper_att.get(paper, paper)
 
     pages = []
     for name in order:
         if name in deleted:
-            continue  # page was deleted; keep it out of the output
-        member = name.split("/")[-1]
-        data = opener(name)
-        p_canvas, p_paper = per_page.get(member, (None, None))
-        if p_canvas:
-            ps = _paper_size(opener, names, resolve_paper(p_paper))
-            page = parse_page(data, attachments, p_canvas, ps)
-        else:
-            page = parse_page(data, attachments, canvas, page_size)
-        paper = resolve_paper(p_paper) or resolve_paper(bg_map.get(member))
+            continue
+        canvas, paper = per_page.get(name.split("/")[-1], (None, None))
+        # a paper UUID may be an internal id; map it to its real attachment
+        paper = paper_att.get(paper, paper) if paper else None
+        size = _paper_size(opener, names, paper) if canvas else None
+        page = parse_page(opener(name), attachments, canvas, size)
         if paper and paper in attachments:
             page.background = attachments[paper]
         pages.append(page)
@@ -726,19 +648,30 @@ def _read_page_meta(opener, names, member_names) -> List[Tuple[str, str,
             if not prev or not prev[1]:
                 layer_info[layer] = (paper, prev[1] if prev else None)
 
-    # 2) pages: f54 create ops (page UUID f2, layer f3, position key f4).
-    #    Display order is NOT creation order: each page carries a
-    #    fractional-index position key (``f4 = {1: key, 2: {1: version}}``,
-    #    e.g. "4mgFG1" < "Am5Pm" < "L2FtP" < "O9t!N"), and moving a page
-    #    rewrites it through an f55 update op (``f3`` = new key, same layout).
-    #    Pages sort by their latest key, bytewise.
+    # 2) pages.  Page properties are versioned registers
+    #    ``{1: value, 2: {1: version}}``; the highest version wins.
+    #    * f54 creates a page (UUID f2) with its paper layer (f3) and position
+    #      key (f4);
+    #    * a top-level f3 op re-assigns the paper layer (f3) — changing a
+    #      page's paper after creation (Test6 page 2: ruled -> plain);
+    #    * f55 moves a page: new position key in f3.
+    #    Display order is NOT creation order: the position key is a
+    #    fractional index ("4mgFG1" < "Am5Pm" < "L2FtP" < "O9t!N"); pages sort
+    #    by their latest key, bytewise.
     member_prefix = {p32: m for p32, m in
                      ((m[-36:][:32], m) for m in member_names)}
-    created: List[Tuple[str, Optional[str]]] = []  # (page UUID, layer)
-    position: Dict[str, Tuple[int, bytes]] = {}    # page -> (version, key)
+    created: List[str] = []
+    layer: Dict[str, Tuple[int, bytes]] = {}
+    position: Dict[str, Tuple[int, bytes]] = {}
+
+    def assign(reg: Dict[str, Tuple[int, bytes]], page: str, msg) -> None:
+        v = _versioned(msg)
+        if v and v[0] >= reg.get(page, (-1, b""))[0]:
+            reg[page] = v
+
     for rec in recs:
         t = parse_message_tolerant(rec)
-        for op, key_field in ((54, 4), (55, 3)):
+        for op in (54, 3, 55):
             if op not in t or not isinstance(t[op][0], (bytes, bytearray)):
                 continue
             body = parse_message_tolerant(t[op][0])
@@ -746,36 +679,39 @@ def _read_page_meta(opener, names, member_names) -> List[Tuple[str, str,
             if not page:
                 continue
             if op == 54:
-                created.append((page, _uuid_from(body.get(3, [None])[0])))
-            pk = _position_key(body.get(key_field, [None])[0])
-            if pk and pk[0] >= position.get(page, (-1, b""))[0]:
-                position[page] = pk
+                created.append(page)
+                assign(layer, page, body.get(3, [None])[0])
+                assign(position, page, body.get(4, [None])[0])
+            elif op == 3:
+                assign(layer, page, body.get(3, [None])[0])
+            else:
+                assign(position, page, body.get(3, [None])[0])
     out: List[Tuple[str, str, Optional[Tuple[float, float]], Optional[str]]] = []
-    for page, layer in created:
+    for page in created:
         member = member_prefix.get(page[:32])
-        paper, cxy = layer_info.get(layer, (None, None)) if layer else (None, None)
-        out.append((member, layer, cxy, paper))
+        lay = _uuid_from(layer[page][1]) if page in layer else None
+        paper, cxy = layer_info.get(lay, (None, None)) if lay else (None, None)
+        out.append((member, lay, cxy, paper))
     # Stable sort: pages without a key keep their creation order at the front.
-    order = {page: position.get(page, (0, b""))[1] for page, _l in created}
-    keyed = sorted(range(len(out)), key=lambda i: order[created[i][0]])
+    keyed = sorted(range(len(out)),
+                   key=lambda i: position.get(created[i], (0, b""))[1])
     return [out[i] for i in keyed]
 
 
-def _position_key(msg) -> Optional[Tuple[int, bytes]]:
-    """Decode a page position ``{1: key bytes, 2: {1: version}}``."""
+def _versioned(msg) -> Optional[Tuple[int, bytes]]:
+    """Decode a versioned register ``{1: value bytes, 2: {1: version}}``."""
     if not isinstance(msg, (bytes, bytearray)):
         return None
     f = parse_message_tolerant(bytes(msg))
-    key = f.get(1, [None])[0]
-    if not isinstance(key, (bytes, bytearray)) or not key:
+    value = f.get(1, [None])[0]
+    if not isinstance(value, (bytes, bytearray)) or not value:
         return None
     ver = f.get(2, [None])[0]
     version = 0
     if isinstance(ver, (bytes, bytearray)):
         v = parse_message_tolerant(bytes(ver)).get(1, [0])[0]
         version = v if isinstance(v, int) else 0
-    return version, bytes(key)
-
+    return version, bytes(value)
 
 def _collect_attachments(opener, names) -> Dict[str, bytes]:
     out: Dict[str, bytes] = {}
@@ -824,95 +760,22 @@ def _read_paper_to_attachment(opener, names) -> Dict[str, str]:
     return out
 
 
-def _read_page_size(opener, names) -> Optional[Tuple[float, float]]:
-    """Recover the page point size from a paper PDF attachment.
-
-    Paper PDFs are stored in ``attachments/<UUID>`` with no extension; they
-    start with ``%PDF`` and carry a ``/MediaBox [0 0 W H]``.  When all paper
-    PDFs share the same size we use it; otherwise we fall back to A4.
-    """
-    import re as _re
-    sizes = set()
-    for n in names:
-        if not n.startswith("attachments/"):
-            continue
-        data = opener(n)
-        if not data or not data.startswith(b"%PDF"):
-            continue
-        m = _re.search(rb"/MediaBox\s*\[0\s+0\s+([\d.]+)\s+([\d.]+)\]", data)
-        if m:
-            sizes.add((float(m.group(1)), float(m.group(2))))
-    if len(sizes) == 1:
-        return sizes.pop()
-    return None
-
-
-def _read_canvas_size(opener, names,
-                      page_size: Optional[Tuple[float, float]]
-                      ) -> Optional[Tuple[float, float]]:
-    """Recover the canvas point size from ``index.events.pb``.
-
-    The event log stores the canvas width and height as float32 fields
-    (834.24 × 1078.82 for sample 5), nested deep in protobuf messages.  A raw
-    f32 byte-scan is noisy, so we disambiguate with the *known* page size:
-    the canvas and the page share the same aspect ratio, so the true
-    ``(canvas_w, canvas_h)`` pair is the one for which
-    ``page_w / canvas_w == page_h / canvas_h`` (a uniform viewport scale).
-    Returns ``None`` when no such pair exists (samples 1-4 have no events
-    file, and their canvas is the page itself, scale 1.0).
-    """
-    if "index.events.pb" not in names or not page_size:
-        return None
-    try:
-        data = opener("index.events.pb")
-    except Exception:
-        return None
-    pw, ph = page_size
-    vals = set()
-    for i in range(0, len(data) - 3):
-        v = struct.unpack_from("<f", data, i)[0]
-        if 200.0 < v < 5000.0:  # plausible note-canvas dimension in points
-            vals.add(round(v, 1))
-    best = None
-    for w in vals:
-        for h in vals:
-            if w >= h * 2.0 or h >= w * 2.0:
-                continue
-            sx = pw / w
-            sy = ph / h
-            if 0.1 <= sx <= 3.0 and abs(sx - sy) < 1e-3:
-                # prefer the largest canvas (smallest scale) among matches
-                if best is None or w * h > best[0] * best[1]:
-                    best = (w, h)
-    if best:
-        return best
-    return None
-
-
 def parse_goodnotes(path: str) -> GoodNotesDocument:
     """Parse a ``.goodnotes`` archive (or an already-extracted directory)."""
     title = os.path.splitext(os.path.basename(path.rstrip("/")))[0]
-
     if os.path.isdir(path):
-        names = []
-        for root, _dirs, files in os.walk(path):
-            for f in files:
-                names.append(os.path.relpath(os.path.join(root, f), path))
+        names = [os.path.relpath(os.path.join(root, f), path)
+                 for root, _dirs, files in os.walk(path) for f in files]
 
         def opener(name):
             with open(os.path.join(path, name), "rb") as fh:
                 return fh.read()
 
-        attachments = _collect_attachments(opener, names)
-        page_size = _read_page_size(opener, names)
-        canvas = _read_canvas_size(opener, names, page_size)
-        pages = _read_page_members(opener, names, attachments, canvas, page_size)
-        return GoodNotesDocument(pages=pages, title=title, canvas=canvas)
-    else:
-        with zipfile.ZipFile(path) as zf:
-            names = zf.namelist()
-            attachments = _collect_attachments(zf.read, names)
-            page_size = _read_page_size(zf.read, names)
-            canvas = _read_canvas_size(zf.read, names, page_size)
-            pages = _read_page_members(zf.read, names, attachments, canvas, page_size)
-            return GoodNotesDocument(pages=pages, title=title, canvas=canvas)
+        return GoodNotesDocument(
+            pages=_read_page_members(opener, names, _collect_attachments(opener, names)),
+            title=title)
+    with zipfile.ZipFile(path) as zf:
+        names = zf.namelist()
+        return GoodNotesDocument(
+            pages=_read_page_members(zf.read, names, _collect_attachments(zf.read, names)),
+            title=title)
