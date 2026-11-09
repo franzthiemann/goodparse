@@ -665,11 +665,11 @@ def test_rtf_line_breaks_and_run_spacing():
 
 
 def test_base14_widths_are_real_metrics():
-    from goodparse.pdf import _run_width
-    assert _run_width("mi", 1000) == 833 + 222                          # Helvetica
-    assert _run_width("mi", 1000, ("Helvetica", True, False)) == 889 + 278
-    assert _run_width("a", 1000, ("Times", False, False)) == 444
-    assert _run_width("abc", 10, ("Courier", False, False)) == pytest.approx(18.0)
+    from goodparse.base14_widths import run_width
+    assert run_width("mi", 1000) == 833 + 222                          # Helvetica
+    assert run_width("mi", 1000, ("Helvetica", True, False)) == 889 + 278
+    assert run_width("a", 1000, ("Times", False, False)) == 444
+    assert run_width("abc", 10, ("Courier", False, False)) == pytest.approx(18.0)
 
 
 def test_text_object_italic_strike_alignment_and_lists():

@@ -5,6 +5,8 @@ Nimbus Roman), which are metric-compatible with Adobe Helvetica / Times.
 Oblique/Italic Helvetica share the upright widths; Courier is 600 throughout.
 0 marks a code with no glyph (undefined in cp1252)."""
 
+from typing import Optional, Tuple
+
 WIDTHS = {
     "Helvetica": (
         278, 278, 355, 556, 556, 889, 667, 191, 333, 333, 389, 584, 278, 333, 278, 278,
@@ -103,3 +105,53 @@ WIDTHS = {
         500, 556, 500, 500, 500, 500, 500, 570, 500, 556, 556, 556, 556, 444, 500, 444,
     ),
 }
+
+
+# Base-14 stand-ins by family class.  GoodNotes names real families; without
+# an installed clone (see font_embed) the closest base-14 face is used.
+BASE14 = {
+    "Helvetica": ("Helvetica", "Helvetica-Bold", "Helvetica-Oblique",
+                  "Helvetica-BoldOblique"),
+    "Times": ("Times-Roman", "Times-Bold", "Times-Italic", "Times-BoldItalic"),
+    "Courier": ("Courier", "Courier-Bold", "Courier-Oblique", "Courier-BoldOblique"),
+}
+_SERIF_FAMILIES = ("georgia", "times", "baskerville", "didot", "palatino",
+                   "cochin", "bodoni", "garamond", "charter", "serif")
+_MONO_FAMILIES = ("courier", "menlo", "monaco", "mono", "consolas")
+
+
+def base14_class(family: Optional[str]) -> str:
+    """Closest base-14 family (Helvetica / Times / Courier) for ``family``."""
+    f = (family or "").lower()
+    if any(k in f for k in _MONO_FAMILIES):
+        return "Courier"
+    if any(k in f for k in _SERIF_FAMILIES) and "sans" not in f:
+        return "Times"
+    return "Helvetica"
+
+
+def base14_key(run) -> Tuple[str, bool, bool]:
+    """``(family class, bold, italic)`` of a text run."""
+    return (base14_class(getattr(run, "font_family", None)),
+            bool(run.bold), bool(run.italic))
+
+
+def base14_font(key: Tuple[str, bool, bool]) -> str:
+    """PostScript name of the base-14 font for ``key``."""
+    cls, bold, italic = key
+    return BASE14[cls][(1 if bold else 0) + (2 if italic else 0)]
+
+
+def run_width(text: str, fs: float, key: Tuple[str, bool, bool] = ("Helvetica", False, False)) -> float:
+    """Advance width of ``text`` in PDF points at size ``fs`` in base-14 font
+    ``key``."""
+    cls, bold, italic = key
+    if cls == "Courier":
+        return len(text) * 0.6 * fs
+    # Helvetica's obliques share the upright widths.
+    table = WIDTHS[base14_font((cls, bold, italic and cls != "Helvetica"))]
+    total = 0
+    for ch in text:
+        code = ch.encode("cp1252", "replace")[0]
+        total += table[code - 0x20] if 0x20 <= code <= 0xFF else table[0]
+    return total / 1000.0 * fs

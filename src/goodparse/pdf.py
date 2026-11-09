@@ -28,7 +28,7 @@ import zlib
 from typing import Dict, List, Optional, Tuple
 
 from .model import GoodNotesDocument, Stroke, TextBox
-from .base14_widths import WIDTHS
+from .base14_widths import base14_font, base14_key, run_width
 from .text_rtf import TextLine, TextRun
 
 # Optional, heavier dependencies for raster media + text.  Kept optional so the
@@ -102,53 +102,6 @@ def _text_font_size(t: TextBox) -> float:
 
 # A text-object line wraps once it exceeds the stored width by this factor.
 _TEXT_WRAP_SLACK = 1.07
-
-# Base-14 stand-ins by family class.  GoodNotes names real families; without
-# an installed clone (see font_embed) the closest base-14 face is used.
-_BASE14 = {
-    "Helvetica": ("Helvetica", "Helvetica-Bold", "Helvetica-Oblique",
-                  "Helvetica-BoldOblique"),
-    "Times": ("Times-Roman", "Times-Bold", "Times-Italic", "Times-BoldItalic"),
-    "Courier": ("Courier", "Courier-Bold", "Courier-Oblique", "Courier-BoldOblique"),
-}
-_SERIF_FAMILIES = ("georgia", "times", "baskerville", "didot", "palatino",
-                   "cochin", "bodoni", "garamond", "charter", "serif")
-_MONO_FAMILIES = ("courier", "menlo", "monaco", "mono", "consolas")
-
-
-def _base14_class(family: Optional[str]) -> str:
-    f = (family or "").lower()
-    if any(k in f for k in _MONO_FAMILIES):
-        return "Courier"
-    if any(k in f for k in _SERIF_FAMILIES) and "sans" not in f:
-        return "Times"
-    return "Helvetica"
-
-
-def _base14_key(run) -> Tuple[str, bool, bool]:
-    return (_base14_class(getattr(run, "font_family", None)),
-            bool(run.bold), bool(run.italic))
-
-
-def _base14_font(key: Tuple[str, bool, bool]) -> str:
-    cls, bold, italic = key
-    return _BASE14[cls][(1 if bold else 0) + (2 if italic else 0)]
-
-
-def _run_width(text: str, fs: float, key: Tuple[str, bool, bool] = ("Helvetica", False, False)) -> float:
-    """Advance width of ``text`` in PDF points at size ``fs`` in base-14 font
-    ``key`` (see :mod:`goodparse.base14_widths`)."""
-    cls, bold, italic = key
-    if cls == "Courier":
-        return len(text) * 0.6 * fs
-    # Helvetica's obliques share the upright widths.
-    table = WIDTHS[_base14_font((cls, bold, italic and cls != "Helvetica"))]
-    total = 0
-    for ch in text:
-        code = ch.encode("cp1252", "replace")[0]
-        total += table[code - 0x20] if 0x20 <= code <= 0xFF else table[0]
-    return total / 1000.0 * fs
-
 
 def _pdf_form_xobject(data: bytes) -> Optional[Tuple[float, float, bytes]]:
     """Turn an embedded *vector PDF* (e.g. a GoodNotes sticker) into a Form
@@ -320,7 +273,7 @@ def _emit_text(parts: List[str], t: TextBox, s: float, h: float,
         e = embedded(run)
         if e:
             return e[1].width(seg) / 1000.0 * size_of(run)
-        return _run_width(seg, size_of(run), _base14_key(run))
+        return run_width(seg, size_of(run), base14_key(run))
 
     # 1) Greedy wrap on word pieces (each keeps its surrounding whitespace).
     layout: List[Tuple[str, List[Tuple[str, TextRun]]]] = []
@@ -371,7 +324,7 @@ def _emit_text(parts: List[str], t: TextBox, s: float, h: float,
                 parts.append(f"/{fname} {fs:.2f} Tf")
                 parts.append(f"BT {cursor:.2f} {baseline:.2f} Td <{ef.code(seg).hex()}> Tj ET")
             else:
-                fname = font_map[_base14_key(run)]
+                fname = font_map[base14_key(run)]
                 parts.append(f"/{fname} {fs:.2f} Tf")
                 parts.append(f"BT {cursor:.2f} {baseline:.2f} Td ({_pdf_escape(seg)}) Tj ET")
             w = width(seg, run)
@@ -547,7 +500,7 @@ def build_pdf(doc: GoodNotesDocument, width_scale: float = 1.0) -> bytes:
                 if not runs:
                     runs = [TextRun(text="")]
                 for r in runs:
-                    used.add(_base14_key(r))
+                    used.add(base14_key(r))
         for fi, key in enumerate(sorted(used)):
             font_map[key] = f"F{fi + 1}"
         next_free += len(font_map)
@@ -600,7 +553,7 @@ def build_pdf(doc: GoodNotesDocument, width_scale: float = 1.0) -> bytes:
     if has_font:
         for fi, key in enumerate(font_map):
             bodies[font_obj + fi] = (
-                f"<< /Type /Font /Subtype /Type1 /BaseFont /{_base14_font(key)}"
+                f"<< /Type /Font /Subtype /Type1 /BaseFont /{base14_font(key)}"
                 " /Encoding /WinAnsiEncoding >>").encode()
 
     for num, payload in embed_objs.items():
