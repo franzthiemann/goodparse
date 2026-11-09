@@ -845,3 +845,105 @@ def test_text_box_background_uses_protobuf_alpha():
     # Default boxes store white without an alpha field (= transparent).
     doc = parse_goodnotes(sample("Test7.goodnotes"))
     assert all(t.background is None for p in doc.pages for t in p.texts)
+
+
+# --------------------------------------------------------------------------- #
+# Pencil: tilt widens, pressure darkens (calibrated on Test_14)
+# --------------------------------------------------------------------------- #
+
+def _pencil_blob(points, width=1.0):
+    """A pencil template: one move + quadratic segments through ``points``
+    (each ``(x, y, azimuth, altitude, pressure)``)."""
+    import struct
+    sig = b"vuA(v)A(S(uuuuu))A(S(uuuuuuuuuuu))A(S(uu))A(v)A(S(uu))A(S(uuuu))A(u)"
+    flags = [0] + [1] * (len(points) - 1)
+    body = struct.pack("<Hf", 2, width)
+    body += struct.pack("<I", len(flags)) + b"".join(struct.pack("<H", f) for f in flags)
+    body += struct.pack("<I", 1) + struct.pack("<5f", *points[0])
+    body += struct.pack("<I", len(points) - 1)
+    for p in points[1:]:
+        body += struct.pack("<11f", 0.0, *p, *p)
+    body += struct.pack("<I", 0) * 5
+    return _tpl(sig, body)
+
+
+def test_pencil_width_follows_tilt_not_pressure():
+    import math
+
+    from goodparse.ink import UNIFORM_WIDTH_FACTOR, decode_ink
+    w = UNIFORM_WIDTH_FACTOR
+
+    def width(alt, pressure):
+        ink = decode_ink(_pencil_blob([(0, 0, 0, alt, pressure), (5, 0, 0, alt, pressure)]))
+        return ink.subpaths[0][-1][2]
+
+    assert width(math.pi / 3, 0.0) == pytest.approx(w)        # finger default
+    assert width(math.pi / 3, 2.0) == pytest.approx(w)        # pressure: no effect
+    assert width(0.51, 1.0) == pytest.approx(w * 4.635, rel=0.001)   # tilted shading
+    assert width(math.pi / 2, 1.0) == pytest.approx(w * 0.577, rel=0.01)  # upright
+    assert width(0.1, 1.0) == width(0.51, 1.0)                # clamped extrapolation
+
+
+def test_pencil_opacity_grows_with_pressure():
+    from goodparse.ink import decode_ink
+    from goodparse.page import PENCIL_OPACITY, pencil_opacity
+    ink = decode_ink(_pencil_blob([(0, 0, 0, 1.0, 1.0), (5, 0, 0, 1.0, 3.0)]))
+    assert ink.pressure == pytest.approx(7 / 3)   # move, control, end point
+    assert pencil_opacity(0.0) == PENCIL_OPACITY               # no pressure data
+    assert pencil_opacity(1.0) == pytest.approx(PENCIL_OPACITY)
+    assert pencil_opacity(4.0) == pytest.approx(2 * PENCIL_OPACITY)
+
+
+def test_translucent_pressure_stroke_is_one_transparency_group():
+    page = Page(width=100, height=100)
+    page.strokes.append(Stroke(points=[(0, 0, 1.0), (10, 0, 2.0), (20, 0, 3.0)],
+                               color=(0, 0, 0, 0.5), kind="pencil"))
+    data = build_pdf(GoodNotesDocument(pages=[page]))
+    assert data.count(b"/Group << /S /Transparency >>") == 1
+    content = zlib.decompress(re.search(rb"stream\n(.*?)\nendstream", data, re.S).group(1))
+    assert re.search(rb"/GS0 gs /Gr\d+ Do", content)
+    assert b" S" not in content                                  # segments live in the group
+
+
+# --------------------------------------------------------------------------- #
+# Xournal++: what it can load and how it treats alpha
+# --------------------------------------------------------------------------- #
+
+def _xopp_root(path):
+    with gzip.open(path, "rb") as fh:
+        return ET.fromstring(fh.read())
+
+
+def test_xopp_images_are_rasters_xournalpp_can_decode(tmp_path):
+    """Xournal++ aborts loading on a non-raster <image>: the vector sticker of
+    Test9 p3 must be rasterised to PNG."""
+    import base64
+    pytest.importorskip("pypdfium2")
+    root = _xopp_root(convert_file(sample("Test9.goodnotes"), str(tmp_path / "t9.xopp")))
+    images = [base64.b64decode(im.text) for im in root.iter("image")]
+    assert images
+    assert all(d[:8] == b"\x89PNG\r\n\x1a\n" or d[:2] == b"\xff\xd8" for d in images)
+
+
+def test_xopp_maps_translucent_strokes():
+    from goodparse.xournal import build_xml
+    page = Page(width=100, height=100)
+    page.strokes += [Stroke(points=[(0, 0, 1), (5, 5, 1)], color=(1, 0, 0, 0.5)),
+                     Stroke(points=[(0, 0, 1), (5, 5, 1)], color=(0, 0, 0, 0.2), kind="pencil"),
+                     Stroke(points=[(0, 0, 1), (5, 5, 1)], color=(0, 0, 1, 1.0))]
+    strokes = list(ET.fromstring(build_xml(GoodNotesDocument(pages=[page]))).iter("stroke"))
+    assert [(s.get("tool"), s.get("color")) for s in strokes] == [
+        ("highlighter", "#ff000080"),   # Xournal++ draws highlighters translucent
+        ("pen", "#ccccccff"),           # pencil: 20 % black blended onto white
+        ("pen", "#0000ffff")]
+
+
+@pytest.mark.skipif(not __import__("shutil").which("xournalpp"), reason="needs Xournal++")
+@pytest.mark.parametrize("name", ["Test5", "Test9", "Test_12", "Test_14"])
+def test_xournalpp_loads_converted_sample(tmp_path, name):
+    import subprocess
+    xopp = convert_file(sample(f"{name}.goodnotes"), str(tmp_path / f"{name}.xopp"))
+    pdf = tmp_path / "out.pdf"
+    subprocess.run(["xournalpp", f"--create-pdf={pdf}", xopp],
+                   capture_output=True, timeout=300, check=True)
+    assert pdf.stat().st_size > 0

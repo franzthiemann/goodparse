@@ -7,6 +7,8 @@ stroke paths, :mod:`goodparse.shapes` for vector shapes and fills, and
 
 from __future__ import annotations
 
+import math
+
 import warnings
 from typing import Dict, List, Optional, Tuple
 
@@ -39,6 +41,17 @@ _SHAPE_DEFAULT_WIDTH = 10.3937
 # covers 4-8 % of a solid stroke in the references (Test8, Test_11), dense
 # self-overlapping scribbles 30-40 % (Test6), because the texture accumulates.
 PENCIL_OPACITY = 0.2
+
+
+def pencil_opacity(pressure: float) -> float:
+    """Flat opacity of a pencil stroke with mean recorded ``pressure``.
+
+    Pressure darkens the grain: on Test_14 the mean coverage of a stroke grows
+    roughly with the square root of its pressure (0.12 at 0.45, 0.41 at 2.1
+    for the wide pencil).  Strokes without pressure data (0) keep the plain
+    PENCIL_OPACITY, which is also the value at pressure 1.
+    """
+    return PENCIL_OPACITY * math.sqrt(pressure) if pressure > 0 else PENCIL_OPACITY
 
 
 def _stroke_origin(content_fields) -> Optional[Tuple[float, float]]:
@@ -149,7 +162,7 @@ def _parse_stroke(cf) -> List[Stroke]:
     kind = "pen"
     if ink.kind == "pencil":
         kind = "pencil"
-        color = (color[0], color[1], color[2], color[3] * PENCIL_OPACITY)
+        color = (color[0], color[1], color[2], color[3] * pencil_opacity(ink.pressure))
     return [Stroke(points=[(x + dx, y + dy, w) for x, y, w in path],
                    color=color, kind=kind)
             for path in ink.subpaths]

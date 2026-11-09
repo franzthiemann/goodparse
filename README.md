@@ -66,7 +66,9 @@ and the origin flips from top-left to bottom-left
 (`y_pdf = page.height - y * scale`). Because a PDF path has a *constant* line
 width, a pressure-varying stroke is drawn as one round-cap segment per point,
 each at the mean of its two endpoint widths — overlapping round caps blend into
-a smooth stroke whose thickness follows the original per-point widths. Shape
+a smooth stroke whose thickness follows the original per-point widths; a
+translucent one (pencil) is painted inside a transparency group so its alpha
+applies once and the overlaps do not darken. Shape
 fills are painted beneath their outline. Colour alpha maps to a shared `/ExtGState` (`/ca` and `/CA`).
 The file is a hand-built, minimally valid PDF 1.4 (stdlib `zlib` only):
 uncompressed dictionaries, Flate-compressed content streams, and a linear
@@ -194,15 +196,23 @@ Known gaps:
   (a GoodNotes bug); the visual tests therefore prefer a flattened export
   (`<name>_flat.pdf`) as reference when one exists.
 
-- **Pencil** is drawn as flat colour at reduced opacity; GoodNotes renders a
-  grain texture that builds up where strokes overlap, which flat colour can
-  only approximate.
+- **Pencil** is drawn as flat colour; GoodNotes renders a grain texture that
+  builds up where strokes overlap, which flat colour can only approximate.
+  Calibrated on Test_14 (light / medium / heavy / upright / tilted, two
+  sizes): tilt sets the width (`w * (1 + 1.27 (cot²(altitude) - 1/3))`, an
+  empirical fit, ±24 %), pressure the opacity (`0.2 * sqrt(pressure)`).  The
+  thin pencil is about twice as dense as that in the reference; with only two
+  sizes measured this is not modelled.
 - **RTF text boxes** wrap at a narrower width than the stored box width; the
   exact wrap rule is not known yet.
 - GoodNotes indents list items slightly; the converter writes the bullet or
   number at the paragraph's left edge.
-- Pencil with Apple Pencil pressure and tilt has only one sample (Test9);
-  a dedicated pencil calibration sample is still to come.
+- **Xournal++ output** has no paper background (pages are plain white) and
+  writes each text box as plain unstyled text.  Xournal++ ignores colour
+  alpha, so highlighters use its highlighter tool (fixed opacity) and pencil
+  is pre-blended onto white.
+- **Excalidraw output** holds strokes and shapes only (no text, images or
+  paper).
 - Every sample uses the same canvas scale (landscape pages too), so whether uniform widths are
   "0.5 pt" or "11/12 canvas units" per unit can't be told apart (identical at
   that scale).

@@ -3,12 +3,14 @@
 A ``.xopp`` file is gzip-compressed XML (Xournal++ file version 4).  The
 element types used:
 
-* ``<stroke tool="pen" color="#RRGGBBAA" width="...">x1 y1 x2 y2 ...</stroke>``
+* ``<stroke tool="pen|highlighter" color="#RRGGBBAA" width="...">x1 y1 ...</stroke>``
   for pen, highlighter and eraser strokes.  ``width`` is the base width
   followed by one width per segment (N points -> N-1 extra values), which
   Xournal++ uses to render pressure-varying strokes.
 * ``<image left top right bottom naturalSize="w h">BASE64</image>`` for
-  embedded rasters (BASE64 is the raw PNG/JPEG, no data-URI prefix).
+  embedded images (BASE64 is the raw PNG/JPEG, no data-URI prefix).
+  Xournal++ only decodes rasters and *aborts loading the whole file* on
+  anything else, so vector (PDF) stickers are rasterised to PNG first.
 * ``<text font size color x y wrap align>TEXT</text>`` for text boxes.
 
 Both GoodNotes and Xournal++ use a *top-left* origin with +y downward, so
@@ -21,9 +23,11 @@ from __future__ import annotations
 
 import base64
 import gzip
+import io
 import re
 import struct
-from typing import List, Tuple
+import warnings
+from typing import List, Optional, Tuple
 from xml.sax.saxutils import escape
 
 from .model import (
@@ -84,15 +88,29 @@ def _stroke_xml(stroke: Stroke, scale: float, width_scale: float) -> str:
 
     A filled shape gets Xournal++'s ``fill`` attribute (fill opacity 0..255);
     Xournal++ fills with the stroke colour, which is what GoodNotes uses too.
+
+    Xournal++ ignores the colour's alpha byte (checked with 1.3.8): a pen
+    always paints opaque and a highlighter at its own fixed opacity (~0.47).
+    So a translucent pen stroke (GoodNotes highlighters are alpha 0.5)
+    becomes ``tool="highlighter"``, and pencil — alpha 0.1-0.3 — stays a pen
+    whose colour is blended onto white paper at its opacity: exact on white,
+    lighter than the original where it overlaps other ink or coloured paper.
     """
     points = _stroke_points(stroke, scale)
-    color = color_to_hex(stroke.color)
+    tool = "pen"
+    r, g, b, a = stroke.color
+    if a < 1.0 and stroke.kind == "pencil":
+        color = color_to_hex((1 - a * (1 - r), 1 - a * (1 - g), 1 - a * (1 - b), 1.0))
+    else:
+        color = color_to_hex(stroke.color)
+        if a < 1.0:
+            tool = "highlighter"
     coords = " ".join(f"{_fmt(x)} {_fmt(y)}" for x, y, _w in points)
     width = _width_attr(points, scale * width_scale)
     fill = ""
     if stroke.fill is not None:
         fill = f' fill="{round(max(0.0, min(1.0, stroke.fill[3])) * 255)}"'
-    return f'<stroke tool="pen" color="{color}"{fill} width="{width}">{coords}</stroke>'
+    return f'<stroke tool="{tool}" color="{color}"{fill} width="{width}">{coords}</stroke>'
 
 
 def _natural_size(data: bytes) -> Tuple[int, int]:
@@ -125,6 +143,39 @@ def _natural_size(data: bytes) -> Tuple[int, int]:
     return (0, 0)
 
 
+# Resolution of rasterised vector stickers, relative to their placed size.
+_STICKER_DPI = 300.0
+
+
+def _xopp_image_data(image: Image, scale: float) -> Optional[bytes]:
+    """PNG/JPEG bytes Xournal++ can decode, or ``None`` (with a warning)."""
+    data = image.data
+    if data[:8] == b"\x89PNG\r\n\x1a\n" or data[:2] == b"\xff\xd8":
+        return data
+    try:
+        if data[:4] == b"%PDF":
+            import pypdfium2 as pdfium
+            doc = pdfium.PdfDocument(data)
+            try:
+                page = doc[0]
+                k = _STICKER_DPI / 72.0 * image.size[0] * scale / page.get_width()
+                bitmap = page.render(scale=k, fill_color=(255, 255, 255, 0))
+                im = bitmap.to_pil()
+                bitmap.close()
+                page.close()
+            finally:
+                doc.close()
+        else:
+            from PIL import Image as PILImage
+            im = PILImage.open(io.BytesIO(data))
+        buf = io.BytesIO()
+        im.save(buf, format="PNG")
+        return buf.getvalue()
+    except Exception as exc:  # missing optional dependency or undecodable data
+        warnings.warn(f"skipping image Xournal++ cannot load: {exc}")
+        return None
+
+
 def _image_xml(image: Image, scale: float) -> str:
     """Emit an ``<image>`` element with the raster base64-encoded.
 
@@ -136,8 +187,11 @@ def _image_xml(image: Image, scale: float) -> str:
     w, h = image.size
     left, top = x * scale, y * scale
     right, bottom = (x + w) * scale, (y + h) * scale
-    natural = _natural_size(image.data)
-    b64 = base64.b64encode(image.data).decode("ascii")
+    data = _xopp_image_data(image, scale)
+    if data is None:
+        return ""
+    natural = _natural_size(data)
+    b64 = base64.b64encode(data).decode("ascii")
     return (f'<image left="{_fmt(left)}" top="{_fmt(top)}" '
             f'right="{_fmt(right)}" bottom="{_fmt(bottom)}" '
             f'naturalSize="{natural[0]} {natural[1]}">{b64}</image>')
@@ -184,7 +238,9 @@ def build_xml(doc: GoodNotesDocument, width_scale: float = DEFAULT_WIDTH_SCALE) 
         lines.append("<layer>")
         # images first, so the ink renders on top
         for image in page.images:
-            lines.append(_image_xml(image, page.scale))
+            xml = _image_xml(image, page.scale)
+            if xml:
+                lines.append(xml)
         for stroke in page.strokes:
             lines.append(_stroke_xml(stroke, page.scale, width_scale))
         for text in page.texts:

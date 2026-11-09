@@ -43,10 +43,11 @@ the stored points.
   needed for rendering.
 * **Uniform pen** (ballpoint, marker, highlighter, shape template) — a single
   width ``u`` then ``A(S(x, y))`` starts and ``A(S(cx, cy, ex, ey))`` segments.
-* **Pencil** — width ``u``, then 5-float points ``(x, y, altitude, azimuth,
+* **Pencil** — width ``u``, then 5-float points ``(x, y, azimuth, altitude,
   pressure)``: starts are ``S(5)``, segments ``S(1 + 5 + 5)`` (a leading
-  word, then control and end point).  Pressure is 0 when no pressure data
-  was recorded.
+  word, then control and end point).  Strokes drawn without an Apple Pencil
+  store altitude pi/3 (1.0472) and pressure 0.  See :func:`_pencil` for
+  how tilt and pressure render.
 
 Widths, measured against the reference exports: a pressure pen renders at
 twice its half-width (red tape 9.0 -> 9.83 pt at scale 6/11); a uniform
@@ -59,6 +60,7 @@ or "11/12 canvas units" cannot be told apart from the available samples.
 
 from __future__ import annotations
 
+import math
 import struct
 from dataclasses import dataclass
 from typing import List, Optional, Sequence, Tuple
@@ -66,6 +68,11 @@ from typing import List, Optional, Sequence, Tuple
 Point = Tuple[float, float, float]  # x, y, full width (canvas units)
 
 UNIFORM_WIDTH_FACTOR = 11.0 / 12.0
+
+# Pencil tilt (see _pencil): width factor 1 + PENCIL_TILT * (cot^2(alt) - 1/3),
+# fitted on Test_14; altitudes below the most tilted measured one are clamped.
+PENCIL_TILT = 1.27
+_PENCIL_MIN_ALTITUDE = 0.51
 _QUAD_STEPS = 6
 
 
@@ -147,6 +154,7 @@ def read_template(raw: bytes) -> Tuple[str, list]:
 class Ink:
     kind: str                  # "pressure" | "uniform" | "pencil"
     subpaths: List[List[Point]]
+    pressure: float = 0.0      # pencil: mean recorded pressure (0 = none)
 
 
 def _quad(p0: Point, c: Point, p1: Point, out: List[Point]) -> None:
@@ -231,15 +239,30 @@ def _uniform(vals: list) -> Ink:
 
 
 def _pencil(vals: list) -> Ink:
-    w = vals[1] * UNIFORM_WIDTH_FACTOR
+    """Pencil nodes ``(x, y, azimuth, altitude, pressure)``.
 
-    def pt(x, y, _alt, _azi, pressure) -> Point:
-        # Pressure scales the width when it was recorded (0 = none).
-        return (x, y, w * pressure if pressure > 0 else w)
+    Measured on Test_14 (light / medium / heavy / upright / tilted lines at
+    two pencil sizes, 10 strokes): the **altitude** sets the width — tilting
+    the pencil shades a wide band — while **pressure** barely changes the
+    width but darkens the grain (handled by the caller via ``Ink.pressure``).
+    The rendered width is ``w * (1 + PENCIL_TILT * (cot^2(alt) - 1/3))``:
+    exactly ``w`` at the finger default altitude pi/3, about 4.5 ``w`` at
+    alt 0.51 and 0.6 ``w`` upright.  An empirical fit (relative RMS 24 %; the
+    grain texture makes single-stroke widths noisy), not a known formula.
+    """
+    w = vals[1] * UNIFORM_WIDTH_FACTOR
+    pressures: List[float] = []
+
+    def pt(x, y, _azi, alt, pressure) -> Point:
+        if pressure > 0:
+            pressures.append(pressure)
+        cot = 1.0 / math.tan(min(max(alt, _PENCIL_MIN_ALTITUDE), math.pi / 2))
+        return (x, y, w * (1.0 + PENCIL_TILT * (cot * cot - 1.0 / 3.0)))
 
     moves = [pt(*s) for s in vals[3]]
     quads = [(pt(*s[1:6]), pt(*s[6:11])) for s in vals[4]]
-    return Ink("pencil", _assemble(vals[2], moves, quads))
+    mean = sum(pressures) / len(pressures) if pressures else 0.0
+    return Ink("pencil", _assemble(vals[2], moves, quads), mean)
 
 
 def decode_ink(raw: bytes) -> Optional[Ink]:

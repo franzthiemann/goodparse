@@ -8,7 +8,8 @@ after that uniform scale.
 Strokes are drawn as vector paths.  A pressure-varying stroke can't be a single
 polyline (PDF line width is constant per path), so each segment is emitted on
 its own with round caps; segment *k* uses the mean of its endpoint widths, and
-the overlapping round caps blend into one smooth, tapering stroke.  Colour alpha
+the overlapping round caps blend into one smooth, tapering stroke (inside a
+transparency group when translucent, so overlaps don't darken).  Colour alpha
 maps to a shared ``/ExtGState`` (``/ca`` / ``/CA``).
 
 Full-fidelity media (page *backgrounds* and *embedded photos*) are embedded as
@@ -221,6 +222,14 @@ def _background_to_jpeg(bg: bytes, index: int = 0) -> Optional[Tuple[int, int, b
     buf = io.BytesIO()
     im.save(buf, format="JPEG", quality=_JPEG_QUALITY)
     return im.width, im.height, buf.getvalue()
+
+
+def _group_xobject(content: str, width: float, height: float) -> bytes:
+    """A page-sized transparency-group Form XObject painting ``content``."""
+    data = zlib.compress(content.encode("cp1252", "replace"))
+    return (f"<< /Type /XObject /Subtype /Form /BBox [0 0 {_num(width, 2)} "
+            f"{_num(height, 2)}] /Group << /S /Transparency >> /Length {len(data)} "
+            "/Filter /FlateDecode >>\nstream\n").encode() + data + b"\nendstream"
 
 
 def _image_obj(w: int, h: int, jpg: bytes) -> bytes:
@@ -447,30 +456,38 @@ def _page_content(page, width_scale: float, alpha_name: Dict[float, str],
         # caps cannot leak into the next stroke.  Round caps and joins (PDF
         # operators are postfix: ``1 J 1 j``) give GoodNotes' rounded ends and
         # let the per-segment pieces of a pressure stroke blend seamlessly.
-        out.append("q 1 J 1 j")
-        # A uniform-width stroke is one continuous path: overlapping
-        # per-segment round caps would double up under alpha.  Only a
-        # width-varying (pressure) stroke is drawn segment by segment.
+        # A uniform-width stroke is one continuous path.  A width-varying
+        # (pressure) stroke is drawn segment by segment; under alpha the
+        # overlapping round caps would double up, so a translucent one is
+        # painted opaque inside a transparency-group Form XObject and the
+        # alpha applied once, to the whole group.
         uniform = max(widths) - min(widths) < 1e-6
-        out.append(f"{_num(widths[0])} w")
-        out.append(f"{_num(r)} {_num(g)} {_num(b)} RG")
-        if a < 1.0:
-            out.append(f"/{alpha_name[round(a, 4)]} gs")
+        path = ["q 1 J 1 j", f"{_num(widths[0])} w", f"{_num(r)} {_num(g)} {_num(b)} RG"]
         if uniform:
-            out.append(f"{_num(pts[0][0] * s, 2)} {_num(h - pts[0][1] * s, 2)} m")
+            path.append(f"{_num(pts[0][0] * s, 2)} {_num(h - pts[0][1] * s, 2)} m")
             for k in range(1, len(pts)):
-                out.append(f"{_num(pts[k][0] * s, 2)} {_num(h - pts[k][1] * s, 2)} l")
-            out.append("S")
+                path.append(f"{_num(pts[k][0] * s, 2)} {_num(h - pts[k][1] * s, 2)} l")
+            path.append("S")
         else:
             for k in range(len(pts) - 1):
                 w = (widths[k] + widths[k + 1]) / 2.0
                 x0, y0, _w0 = pts[k]
                 x1, y1, _w1 = pts[k + 1]
-                out.append(f"{_num(w)} w")
-                out.append(f"{_num(x0 * s, 2)} {_num(h - y0 * s, 2)} m")
-                out.append(f"{_num(x1 * s, 2)} {_num(h - y1 * s, 2)} l")
-                out.append("S")
-        out.append("Q")
+                path.append(f"{_num(w)} w")
+                path.append(f"{_num(x0 * s, 2)} {_num(h - y0 * s, 2)} m")
+                path.append(f"{_num(x1 * s, 2)} {_num(h - y1 * s, 2)} l")
+                path.append("S")
+        path.append("Q")
+        if a >= 1.0:
+            out.extend(path)
+        elif uniform:
+            out.extend(path[:3] + [f"/{alpha_name[round(a, 4)]} gs"] + path[3:])
+        else:
+            num = take_num()
+            name = f"Gr{num}"
+            img_bodies[num] = _group_xobject("\n".join(path), page.width, h)
+            xrefs.append(f"/{name} {num} 0 R")
+            out.append(f"q /{alpha_name[round(a, 4)]} gs /{name} Do Q")
 
     # --- text --------------------------------------------------------------- #
     if has_font:
