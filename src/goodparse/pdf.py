@@ -25,10 +25,10 @@ from __future__ import annotations
 
 import re
 import zlib
-from types import SimpleNamespace
 from typing import Dict, List, Optional, Tuple
 
 from .goodnotes import GoodNotesDocument, Stroke, TextBox
+from .text_rtf import TextLine, TextRun
 
 # Optional, heavier dependencies for raster media + text.  Kept optional so the
 # core library imports with zero third-party packages (the stroke-only path is
@@ -124,17 +124,50 @@ for _c, _w in [(0x44, 722), (0x57, 944), (0x46, 611), (0x54, 611),
     _HELVETICA_ADV[_c] = _w
 
 
-def _run_width(text: str, fs: float) -> float:
-    """Approximate advance width of ``text`` in PDF points at font size ``fs``."""
+# Base-14 stand-ins by family class.  GoodNotes names real families; without
+# an installed clone (see font_embed) the closest base-14 face is used.
+_BASE14 = {
+    "Helvetica": ("Helvetica", "Helvetica-Bold", "Helvetica-Oblique",
+                  "Helvetica-BoldOblique"),
+    "Times": ("Times-Roman", "Times-Bold", "Times-Italic", "Times-BoldItalic"),
+    "Courier": ("Courier", "Courier-Bold", "Courier-Oblique", "Courier-BoldOblique"),
+}
+_SERIF_FAMILIES = ("georgia", "times", "baskerville", "didot", "palatino",
+                   "cochin", "bodoni", "garamond", "charter", "serif")
+_MONO_FAMILIES = ("courier", "menlo", "monaco", "mono", "consolas")
+
+
+def _base14_class(family: Optional[str]) -> str:
+    f = (family or "").lower()
+    if any(k in f for k in _MONO_FAMILIES):
+        return "Courier"
+    if any(k in f for k in _SERIF_FAMILIES) and "sans" not in f:
+        return "Times"
+    return "Helvetica"
+
+
+def _base14_key(run) -> Tuple[str, bool, bool]:
+    return (_base14_class(getattr(run, "font_family", None)),
+            bool(run.bold), bool(run.italic))
+
+
+def _base14_font(key: Tuple[str, bool, bool]) -> str:
+    cls, bold, italic = key
+    return _BASE14[cls][(1 if bold else 0) + (2 if italic else 0)]
+
+
+def _run_width(text: str, fs: float, cls: str = "Helvetica") -> float:
+    """Advance width of ``text`` in PDF points at font size ``fs``.
+
+    Courier is exactly 600/1000 em per glyph; Times is approximated with the
+    Helvetica advances (close enough to place underlines and centre lines).
+    """
+    if cls == "Courier":
+        return len(text) * 0.6 * fs
     total = 0.0
     for ch in text:
         total += _HELVETICA_ADV.get(ord(ch), 556)
     return total / 1000.0 * fs
-
-
-def _font_name(bold: bool, italic: bool,
-               font_map: Dict[Tuple[bool, bool], str]) -> str:
-    return "/" + font_map.get((bold, italic), "F1")
 
 
 def _pdf_form_xobject(data: bytes) -> Optional[Tuple[float, float, bytes]]:
@@ -262,127 +295,103 @@ def _image_obj(w: int, h: int, jpg: bytes) -> bytes:
 
 
 def _emit_text(parts: List[str], t: TextBox, s: float, h: float,
-               font_map: Dict[Tuple[bool, bool], str],
+               font_map: Dict[Tuple[str, bool, bool], str],
                embed_map: Optional[Dict] = None) -> None:
-    """Append ``Tj``/line ops for a text box (top-left origin -> PDF).
+    """Append text ops for a text box (top-left origin -> PDF).
 
-    Each styled run is emitted with its own font (``/F1``.. = plain,
-    bold, italic, bold-italic); underlines and strikethroughs are thin vector
-    lines positioned under/through the run using the Helvetica advance widths.
-    Runs are reflowed word-by-word so they wrap to the box width (matching the
-    reference, which wraps a long line) instead of overflowing the page.
+    Each :class:`TextLine` starts a new line; within it, runs keep their exact
+    text (spaces included), so adjacent styled runs join exactly as in the
+    original.  A run is drawn with its own size, colour and font: an embedded
+    subset of the named family when its clone is installed (2-byte glyph-ID
+    ``<hex>`` strings, real advance widths), else the closest base-14 family
+    (Helvetica / Times / Courier).  Underlines and strikethroughs are thin
+    vector lines under/through the run.
 
-    When a run names a font family whose clone is installed (and fontTools is
-    available), it is emitted with an embedded subset font using 2-byte
-    glyph-ID codes (``<hex>``) and the font's real advance widths, so the
-    glyphs match the original.  Runs whose family isn't installed keep the
-    base-14 Helvetica path.
+    RTF text boxes wrap to their box width.  Text objects (explicit
+    ``font_size``) are laid out exactly as stored — GoodNotes' line breaks are
+    explicit — and only use the box width to honour a line's alignment.
     """
-    # Field-21 sticker text stores its size in *canvas* units (like every other
-    # box) so it flows through the same canvas→page scale ``s``; the size is
-    # explicit so ``_text_font_size`` returns it directly.  It is a single
-    # unbreakable line (no real box width) so it must never wrap.
-    fs = _text_font_size(t) * s
+    box_fs = _text_font_size(t) * s
     x0 = t.position[0] * s
-    top = t.position[1] * s
-    box_w = float("inf") if t.font_size > 0 else max(fs * 0.5, t.size[0] * s)
-    leading = fs * 1.2
+    box_w = t.size[0] * s
+    wrap_w = float("inf") if t.font_size > 0 else max(box_fs * 0.5, box_w)
+    lines = t.lines or [TextLine(runs=[TextRun(text=t.plain, color=t.color)])]
 
-    lines = t.lines if t.lines else [SimpleNamespace(
-        runs=[SimpleNamespace(text=t.plain, bold=False, italic=False,
-                              underline=False, strike=False, color=t.color)])]
-
-    # Flatten every run into (word, run-attrs) tokens, keeping each word's
-    # trailing space so styled runs join with the exact spacing of the original
-    # (GoodNotes packs words tight: "Test123italic" with no added spaces).
-    tokens = []
-    for line in lines:
-        for run in line.runs:
-            if not run.text:
-                continue
-            fam = getattr(run, "font_family", None)
-            for w in run.text.split(" "):
-                if not w:
-                    continue
-                tokens.append(SimpleNamespace(
-                    text=w, bold=run.bold, italic=run.italic,
-                    underline=run.underline, strike=run.strike,
-                    color=run.color, font_family=fam))
-
-    def _tok_embed(tok):
-        """Embedded font (``(res, ef)``) for a token, or ``None`` if base-14."""
-        if embed_map and tok.font_family:
-            ent = embed_map.get((tok.font_family, bool(tok.bold),
-                                 bool(tok.italic)))
+    def embedded(run):
+        if embed_map and run.font_family:
+            ent = embed_map.get((run.font_family, bool(run.bold), bool(run.italic)))
             if ent:
                 return ent[0], ent[1]
         return None
 
-    def _tok_width(tok, seg: str) -> float:
-        e = _tok_embed(tok)
+    def size_of(run) -> float:
+        return run.size * s if run.size else box_fs
+
+    def width(seg: str, run) -> float:
+        e = embedded(run)
         if e:
-            return e[1].width(seg) / 1000.0 * fs
-        return _run_width(seg, fs)
+            return e[1].width(seg) / 1000.0 * size_of(run)
+        return _run_width(seg, size_of(run), _base14_class(run.font_family))
 
-    # Greedy word wrap across visual lines.
-    vlines: List[List] = [[]]
-    used = 0.0
-    for tok in tokens:
-        w = _tok_width(tok, tok.text)
-        space = _tok_width(tok, " ")
-        add = w + (space if vlines[-1] else 0.0)
-        if vlines[-1] and used + add > box_w and used > 0:
-            vlines.append([tok])
-            used = w
-        else:
-            vlines[-1].append(tok)
-            used += add
-
-    for j, vline in enumerate(vlines):
-        if not vline:
-            continue
-        baseline = h - (top + fs * 0.8 + j * leading)
-        cursor = x0
-        for k, tok in enumerate(vline):
-            r, g, b, _a = tok.color
-            seg = tok.text
-            if k < len(vline) - 1:
-                seg += " "
-            parts.append(f"{_num(r)} {_num(g)} {_num(b)} rg")
-            emb = _tok_embed(tok)
-            if emb is not None:
-                # Embedded subset font: 2-byte glyph-ID codes in a <hex>
-                # string; advance comes from the font's real widths.
-                fname, ef = emb
-                hexcodes = ef.code(seg).hex()
-                parts.append(f"{fname} {fs:.2f} Tf")
-                parts.append(
-                    f"BT {cursor:.2f} {baseline:.2f} Td <{hexcodes}> Tj ET")
-                w = ef.width(seg) / 1000.0 * fs
-            else:
-                fname = _font_name(bool(tok.bold), bool(tok.italic), font_map)
-                parts.append(f"{fname} {fs:.2f} Tf")
-                parts.append(
-                    f"BT {cursor:.2f} {baseline:.2f} Td ({_pdf_escape(seg)}) Tj ET")
-                w = _run_width(seg, fs)
-            if tok.underline:
-                uy = baseline - fs * 0.12
-                parts.append(f"{_num(r)} {_num(g)} {_num(b)} RG")
-                parts.append(f"{max(0.5, fs * 0.05):.2f} w "
-                             f"{cursor:.2f} {uy:.2f} m "
-                             f"{cursor + w:.2f} {uy:.2f} l S")
-            if tok.strike:
-                sy = baseline + fs * 0.33
-                parts.append(f"{_num(r)} {_num(g)} {_num(b)} RG")
-                parts.append(f"{max(0.5, fs * 0.05):.2f} w "
-                             f"{cursor:.2f} {sy:.2f} m "
-                             f"{cursor + w:.2f} {sy:.2f} l S")
-            cursor += w
+    # Text objects store their laid-out content height, which is the real
+    # font's line height times the line count (e.g. 29 for 24 pt Helvetica
+    # Neue, 74 for 55 pt Futura): use it rather than guessing font metrics.
+    stored_line_h = (t.size[1] * s / len(lines)
+                     if t.font_size > 0 and t.size[1] > 0 else 0.0)
+    y = t.position[1] * s
+    for line in lines:
+        # Greedy wrap on word pieces (each keeps its surrounding whitespace).
+        vlines: List[List[Tuple[str, TextRun]]] = [[]]
+        used = 0.0
+        for run in line.runs:
+            for seg in re.findall(r"\s*\S+\s*|\s+", run.text):
+                if vlines[-1] and used + width(seg.rstrip(), run) > wrap_w:
+                    vlines.append([])
+                    used = 0.0
+                    seg = seg.lstrip()
+                vlines[-1].append((seg, run))
+                used += width(seg, run)
+        for vl in vlines:
+            fs_line = max((size_of(run) for _seg, run in vl), default=box_fs)
+            line_h = stored_line_h or fs_line * 1.2
+            baseline = h - (y + line_h * (0.8 if stored_line_h else 2 / 3))
+            y += line_h
+            if not vl:
+                continue
+            line_w = sum(width(seg, run) for seg, run in vl[:-1])
+            line_w += width(vl[-1][0].rstrip(), vl[-1][1])
+            cursor = x0
+            if box_w > 0 and line.align == "center":
+                cursor = x0 + (box_w - line_w) / 2.0
+            elif box_w > 0 and line.align == "right":
+                cursor = x0 + box_w - line_w
+            for seg, run in vl:
+                fs = size_of(run)
+                r, g, b, _a = run.color
+                parts.append(f"{_num(r)} {_num(g)} {_num(b)} rg")
+                emb = embedded(run)
+                if emb is not None:
+                    fname, ef = emb
+                    parts.append(f"/{fname} {fs:.2f} Tf")
+                    parts.append(f"BT {cursor:.2f} {baseline:.2f} Td <{ef.code(seg).hex()}> Tj ET")
+                else:
+                    fname = font_map[_base14_key(run)]
+                    parts.append(f"/{fname} {fs:.2f} Tf")
+                    parts.append(f"BT {cursor:.2f} {baseline:.2f} Td ({_pdf_escape(seg)}) Tj ET")
+                w = width(seg, run)
+                for flag, dy in ((run.underline, -0.12), (run.strike, 0.33)):
+                    if flag:
+                        ly = baseline + fs * dy
+                        parts.append(f"{_num(r)} {_num(g)} {_num(b)} RG")
+                        parts.append(f"{max(0.5, fs * 0.05):.2f} w "
+                                     f"{cursor:.2f} {ly:.2f} m "
+                                     f"{cursor + width(seg.rstrip(), run):.2f} {ly:.2f} l S")
+                cursor += w
 
 
 def _page_content(page, width_scale: float, alpha_name: Dict[float, str],
                   has_font: bool, next_num: int,
-                  font_map: Dict[Tuple[bool, bool], str],
+                  font_map: Dict[Tuple[str, bool, bool], str],
                   embed_map: Optional[Dict] = None
                   ) -> Tuple[str, List[str], Dict[int, bytes]]:
     """Build a page's content stream plus its image XObject objects.
@@ -549,7 +558,7 @@ def build_pdf(doc: GoodNotesDocument, width_scale: float = 1.0) -> bytes:
     # Number the remaining objects without gaps: fonts (if text) then images.
     # /F1..Fn = Helvetica plain / bold / italic / bold-italic; only the
     # variants actually referenced by a styled run get an object.
-    font_map: Dict[Tuple[bool, bool], str] = {}
+    font_map: Dict[Tuple[str, bool, bool], str] = {}
     next_free = ext_first + len(alphas)
     font_obj = next_free
     if has_font:
@@ -558,12 +567,11 @@ def build_pdf(doc: GoodNotesDocument, width_scale: float = 1.0) -> bytes:
             for t in page.texts:
                 runs = [r for ln in (t.lines or []) for r in ln.runs]
                 if not runs:
-                    runs = [SimpleNamespace(bold=False, italic=False, text="")]
+                    runs = [TextRun(text="")]
                 for r in runs:
-                    used.add((bool(r.bold), bool(r.italic)))
-        for fi, (bold, italic) in enumerate(
-                sorted(used, key=lambda b: (b[0], b[1]))):
-            font_map[(bold, italic)] = f"F{fi + 1}"
+                    used.add(_base14_key(r))
+        for fi, key in enumerate(sorted(used)):
+            font_map[key] = f"F{fi + 1}"
         next_free += len(font_map)
     # Optional embedded fonts: for any run that names a non-base-14 family
     # (e.g. "Futura") whose clone is installed, subset it and embed it so the
@@ -590,7 +598,11 @@ def build_pdf(doc: GoodNotesDocument, width_scale: float = 1.0) -> bytes:
             path = _font_embed.find_font_file(fam, bold, italic)
             if not path:
                 continue
-            ef = _font_embed.subset_and_embed(path, text, "GP")
+            # Subset fonts need distinct names: "ABCDEF+Family[Bold][Italic]".
+            n = len(embed_map)
+            tag = "GP" + "".join(chr(65 + (n // 26 ** k) % 26) for k in range(4))
+            style = ("Bold" if bold else "") + ("Italic" if italic else "")
+            ef = _font_embed.subset_and_embed(path, text, f"{tag}+{fam}{style}")
             if ef is None:
                 continue
             res = "EF%d" % (len(embed_map) + 1)
@@ -608,14 +620,10 @@ def build_pdf(doc: GoodNotesDocument, width_scale: float = 1.0) -> bytes:
     for j, a in enumerate(alphas):
         bodies[extg_obj(j)] = f"<< /ca {_num(a)} /CA {_num(a)} >>".encode()
     if has_font:
-        _base = {(False, False): "/Helvetica", (True, False): "/Helvetica-Bold",
-                 (False, True): "/Helvetica-Oblique",
-                 (True, True): "/Helvetica-BoldOblique"}
-        for fi, ((bold, italic), fname) in enumerate(font_map.items()):
+        for fi, key in enumerate(font_map):
             bodies[font_obj + fi] = (
-                b"<< /Type /Font /Subtype /Type1 /BaseFont "
-                + _base[(bold, italic)].encode()
-                + b" /Encoding /WinAnsiEncoding >>")
+                f"<< /Type /Font /Subtype /Type1 /BaseFont /{_base14_font(key)}"
+                " /Encoding /WinAnsiEncoding >>").encode()
 
     for num, payload in embed_objs.items():
         bodies[num] = payload
@@ -640,7 +648,7 @@ def build_pdf(doc: GoodNotesDocument, width_scale: float = 1.0) -> bytes:
         if has_font:
             font_refs = " ".join(
                 f"/{fname} {font_obj + fi} 0 R"
-                for fi, ((bold, italic), fname) in enumerate(font_map.items()))
+                for fi, fname in enumerate(font_map.values()))
             if embed_map:
                 font_refs += " " + " ".join(
                     f"/{res} {base_obj} 0 R"

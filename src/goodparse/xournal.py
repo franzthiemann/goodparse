@@ -144,7 +144,10 @@ def _image_xml(image: Image, scale: float) -> str:
 
 
 def _estimate_font_size(text: TextBox) -> float:
-    """Guess a point size from the RTF's ``\\fs`` (half-points) if present."""
+    """Canvas-unit size: explicit for text objects, else guessed from the RTF's
+    ``\\fs`` (half-points) or the box height."""
+    if text.font_size > 0:
+        return text.font_size
     m = re.search(r"\\fs(\d+)", text.rtf)
     if m:
         return int(m.group(1)) / 2.0
@@ -160,7 +163,7 @@ def _text_xml(text: TextBox, scale: float) -> str:
     (RTF-stripped) text.
     """
     x, y = text.position
-    size = _estimate_font_size(text)
+    size = _estimate_font_size(text) * scale
     color = color_to_hex(text.color)
     content = escape(text.plain)
     return (f'<text font="Sans" size="{_fmt(size)}" color="{color}" '

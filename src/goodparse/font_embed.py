@@ -38,6 +38,11 @@ _FAMILY_CANDIDATES: Dict[str, Tuple[str, ...]] = {
     "Avenir": ("Montserrat", "URW Gothic"),
     "Helvetica Neue": ("Nimbus Sans", "Helvetica Neue", "Helvetica"),
     "Helvetica": ("Nimbus Sans", "Helvetica"),
+    # Georgia: Gelasio is its metric-compatible clone; Nimbus Roman (Times
+    # shape) is the fallback that ships with fonts-urw-base35.
+    "Georgia": ("Gelasio", "Nimbus Roman", "Georgia"),
+    "Times New Roman": ("Nimbus Roman", "Liberation Serif", "Times New Roman"),
+    "Courier New": ("Nimbus Mono PS", "Liberation Mono", "Courier New"),
 }
 
 # A subsetted CFF larger than this is dropped (fall back to base-14) to keep
@@ -109,6 +114,32 @@ class EmbeddedFont:
         return sum(self.widths.get(ch, 278) for ch in text)
 
 
+def _utf16_hex(ch: str) -> str:
+    return ch.encode("utf-16-be").hex().upper()
+
+
+def _to_unicode_cmap(ef: EmbeddedFont) -> str:
+    """ToUnicode CMap mapping each 2-byte glyph code back to its character,
+    so the embedded text stays selectable and searchable.
+
+    ``bfchar`` blocks hold at most 100 entries each and must state their exact
+    count; both sides are hex strings.
+    """
+    pairs = sorted((code.hex().upper(), _utf16_hex(ch))
+                   for ch, code in ef.char_codes.items())
+    out = ["/CIDInit /ProcSet findresource begin", "12 dict begin", "begincmap",
+           "/CIDSystemInfo << /Registry (Adobe) /Ordering (UCS) /Supplement 0 >> def",
+           "/CMapName /Adobe-Identity-UCS def", "/CMapType 2 def",
+           "1 begincodespacerange", "<0000> <FFFF>", "endcodespacerange"]
+    for i in range(0, len(pairs), 100):
+        chunk = pairs[i:i + 100]
+        out.append(f"{len(chunk)} beginbfchar")
+        out.extend(f"<{src}> <{dst}>" for src, dst in chunk)
+        out.append("endbfchar")
+    out += ["endcmap", "CMapName currentdict /CMap defineresource pop", "end", "end"]
+    return "\n".join(out)
+
+
 def build_font_objects(base_num: int, ef: EmbeddedFont) -> Dict[int, bytes]:
     """Build the five PDF objects for ``ef`` starting at ``base_num``.
 
@@ -122,12 +153,7 @@ def build_font_objects(base_num: int, ef: EmbeddedFont) -> Dict[int, bytes]:
         "%d %d %d" % (int.from_bytes(ef.char_codes[ch], "big"),
                       int.from_bytes(ef.char_codes[ch], "big"), ef.widths[ch])
         for ch in sorted(ef.char_codes, key=lambda c: int.from_bytes(ef.char_codes[c], "big")))
-    touni = "\n".join([
-        "/CIDInit /ProcSet findresource begin", "12 dict begin", "begincmap",
-        "1 beginbfchar",
-        *[ "%04X <%04X>" % (int.from_bytes(ef.char_codes[ch], "big"), ord(ch))
-           for ch in sorted(ef.char_codes) ],
-        "endbfchar endcmap", "end", "end"]).encode("ascii", "replace")
+    touni = _to_unicode_cmap(ef).encode("ascii")
     return {
         t0: ("<< /Type /Font /Subtype /Type0 /BaseFont /" + ef.base +
              " /Encoding /Identity-H /DescendantFonts [%d 0 R] /ToUnicode %d 0 R >>"
@@ -156,7 +182,7 @@ def subset_and_embed(path: str, text: str, base: str) -> Optional[EmbeddedFont]:
         return None
     TTFont = _TTFont
     ftsubset = _ftsubset
-    unicodes = sorted({ord(c) for c in text if ord(c) > 0x20})
+    unicodes = sorted({ord(c) for c in text if ord(c) >= 0x20})
     if not unicodes:
         return None
     try:
@@ -165,8 +191,6 @@ def subset_and_embed(path: str, text: str, base: str) -> Optional[EmbeddedFont]:
             return None
         upm = font["head"].unitsPerEm
         hhea = font["hhea"]
-        hmtx = font["hmtx"]
-        cmap = font.getBestCmap()
         opts = ftsubset.Options()
         opts.glyph_names = False
         opts.notdef_outline = True
@@ -192,7 +216,7 @@ def subset_and_embed(path: str, text: str, base: str) -> Optional[EmbeddedFont]:
         widths: Dict[str, int] = {}
         w_entries: List[str] = []
         for ch in sorted(set(text)):
-            if ord(ch) <= 0x20:
+            if ord(ch) < 0x20:
                 continue
             name = cmap2.get(ord(ch))
             if not name:
@@ -208,8 +232,7 @@ def subset_and_embed(path: str, text: str, base: str) -> Optional[EmbeddedFont]:
     except Exception:
         return None
 
-    safe = base.replace(" ", "")[:60]
-    safe = safe.replace("-", "").replace("_", "") or "GoodParseFont"
+    safe = "".join(c for c in base if c.isalnum() or c == "+")[:60] or "GoodParseFont"
     ascent = int(round(hhea.ascent * 1000 / upm))
     descent = int(round(hhea.descent * 1000 / upm))
     flag = 0b01  # symbol (no built-in metrics to trust)

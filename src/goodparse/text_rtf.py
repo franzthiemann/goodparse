@@ -31,12 +31,16 @@ class TextRun:
     # Used only by the optional embedded-font path; the base-14 emitter
     # ignores it.
     font_family: Optional[str] = None
+    # Explicit size in canvas units (text objects carry one per run); None =
+    # the box's size.
+    size: Optional[float] = None
 
 
 @dataclass
 class TextLine:
     """One visual line of a text box: an ordered list of styled runs."""
     runs: List[TextRun] = field(default_factory=list)
+    align: str = "left"  # "left" | "center" | "right" | "justify"
 
     def text(self) -> str:
         return "".join(r.text for r in self.runs)

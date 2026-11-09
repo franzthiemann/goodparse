@@ -555,3 +555,40 @@ def test_page_order_follows_position_keys_not_creation():
     sizes = [(round(p.width), round(p.height)) for p in doc.pages]
     assert sizes[5] == (595, 842)
     assert sizes[6] == (455, 143)
+
+
+# --------------------------------------------------------------------------- #
+# Text objects (kind 21): decoded from the decompressed run blob
+# --------------------------------------------------------------------------- #
+
+def _texts(name, page):
+    doc = parse_goodnotes(sample(name))
+    return {t.plain: t for t in doc.pages[page].texts}
+
+
+def test_text_object_attributes():
+    t = _texts("Test_11.goodnotes", 6)
+    run = lambda k: t[k].lines[0].runs[-1]  # noqa: E731
+    assert set(t) >= {"Text", "Modern", "Classic", "Technical", "small", "Bold",
+                      "Underlined", "• Bullet", "1. Numbered", "Centered", "Yellow"}
+    assert run("Classic").font_family == "Georgia"
+    assert run("Technical").font_family == "Courier New"
+    assert run("Bold").bold and not run("Modern").bold
+    assert run("Underlined").underline and not run("Modern").underline
+    assert run("small").size == pytest.approx(18.0) and run("Modern").size == pytest.approx(24.0)
+    assert run("Yellow").color[:3] == pytest.approx((0.9686, 0.7922, 0.1137), abs=1e-3)
+    assert t["Centered"].lines[0].align == "center"
+    assert t["Modern"].lines[0].align == "left"
+    # no stray protobuf bytes leak into the text (old byte-scan decoder did)
+    assert all(ch.isprintable() for k in t for ch in k)
+
+
+def test_pdf_text_is_drawn_and_extractable(tmp_path):
+    pdfium = pytest.importorskip("pypdfium2")
+    out = tmp_path / "t11.pdf"
+    convert_file(sample("Test_11.goodnotes"), str(out))
+    pdf = pdfium.PdfDocument(str(out))
+    assert pdf[1].get_textpage().get_text_range() == "Moved"
+    text = pdf[6].get_textpage().get_text_range()
+    for word in ("Classic", "Technical", "• Bullet", "1. Numbered", "Yellow"):
+        assert word in text
