@@ -12,7 +12,7 @@ import pytest
 from goodparse import convert_file, parse_goodnotes
 from goodparse.applelz4 import apple_decompress, lz4_block_decompress
 from goodparse.excalidraw import color_to_rgb_hex
-from goodparse.goodnotes import GoodNotesDocument, Page, Stroke, extract_points
+from goodparse.goodnotes import GoodNotesDocument, Page, Stroke
 from goodparse.pdf import build_pdf
 from goodparse.xournal import color_to_hex
 
@@ -69,7 +69,9 @@ def test_test1_line_geometry():
     line = max(strokes, key=lambda s: len(s.points))
     assert len(line.points) >= 10
     first, last = line.points[0], line.points[-1]
-    assert first[0] == pytest.approx(505, abs=3) and first[1] == pytest.approx(438, abs=3)
+    # the path's move-to node (the old heuristic decoder skipped it and
+    # started ~28 units further along, at (505, 438))
+    assert first[0] == pytest.approx(515.6, abs=0.5) and first[1] == pytest.approx(410.6, abs=0.5)
     assert last[0] == pytest.approx(486, abs=3) and last[1] == pytest.approx(712, abs=3)
 
 
@@ -592,3 +594,60 @@ def test_pdf_text_is_drawn_and_extractable(tmp_path):
     text = pdf[6].get_textpage().get_text_range()
     for word in ("Classic", "Technical", "• Bullet", "1. Numbered", "Yellow"):
         assert word in text
+
+
+# --------------------------------------------------------------------------- #
+# Stroke geometry: the self-describing tpl container (goodparse.ink)
+# --------------------------------------------------------------------------- #
+
+def _all_stroke_blobs():
+    import glob
+    import zipfile
+
+    from goodparse.applelz4 import is_apple_lz4
+    from goodparse.records import read_page_objects
+    for path in sorted(glob.glob(os.path.join(SAMPLES, "*.goodnotes"))):
+        with zipfile.ZipFile(path) as z:
+            for n in z.namelist():
+                if not n.startswith("notes/"):
+                    continue
+                for o in read_page_objects(z.read(n)):
+                    for b in o.fields.get(2, []) if o.kind == 7 else []:
+                        if isinstance(b, (bytes, bytearray)) and is_apple_lz4(bytes(b)):
+                            yield path, apple_decompress(bytes(b))
+
+
+def test_every_stroke_blob_parses_exactly():
+    # read_template raises unless the signature consumes the blob exactly.
+    from goodparse.ink import decode_ink, read_template
+    sigs = set()
+    for _path, raw in _all_stroke_blobs():
+        sig, _vals = read_template(raw)
+        sigs.add(sig)
+        decode_ink(raw)
+    assert len(sigs) == 4
+
+
+def test_ink_template_reader_packed_layout():
+    import struct
+
+    from goodparse.ink import decode_ink, read_template
+    sig = b"vuA(v)A(S(uu))A(S(uuuu))"
+    body = (struct.pack("<Hf", 1, 12.0) + struct.pack("<IHH", 2, 0, 1)
+            + struct.pack("<I2f", 1, 0.0, 0.0) + struct.pack("<I4f", 1, 10.0, 0.0, 20.0, 0.0))
+    raw = b"tpl\0" + struct.pack("<I", 0) + sig + b"\0" + body
+    raw = raw[:4] + struct.pack("<I", len(raw)) + raw[8:]
+    assert read_template(raw)[0] == sig.decode()
+    ink = decode_ink(raw)
+    (path,) = ink.subpaths
+    assert path[0] == (0.0, 0.0, pytest.approx(11.0))  # 12 units * 11/12
+    assert path[-1][:2] == pytest.approx((20.0, 0.0))
+
+
+def test_uniform_widths_match_reference_calibration():
+    # Test_11 calibration page: highlighters 12 / 24 / 32.2 units render at
+    # 6.0 / 12.0 / 16.25 pt in GoodNotes' own export (0.5 pt per unit).
+    doc = parse_goodnotes(sample("Test_11.goodnotes"))
+    page = doc.pages[5]
+    hl = sorted(s.points[0][2] * page.scale for s in page.strokes if s.color[3] == 0.5)
+    assert hl == pytest.approx([6.0, 12.0, 16.11], abs=0.01)

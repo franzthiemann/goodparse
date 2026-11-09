@@ -37,11 +37,13 @@ from __future__ import annotations
 import os
 import re
 import struct
+import warnings
 import zipfile
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
 from .applelz4 import apple_decompress, is_apple_lz4
+from .ink import TemplateError, decode_ink
 from .protobuf import (
     get_bytes,
     iter_fields,
@@ -60,66 +62,22 @@ from .records import (
 )
 from .richtext import decode_text_object
 from .shapes import decode_outline, outline_width
-from .text_rtf import TextLine, TextRun, parse_rtf_runs
+from .text_rtf import TextLine, parse_rtf_runs
 
 # A4 in PDF points (72 dpi) — fallback for documents without an explicit page
 # size (samples 1-4 are A4).
 A4_WIDTH_PT = 595.28
 A4_HEIGHT_PT = 841.89
 
-# Points live after the 8-byte "tpl\0"+length header and the 40-byte constant
-# style template; restricting the search to offset >= 64 avoids decoding the
-# template (which spuriously looks like a point near (10.6, 10.6)).
-_POINT_SEARCH_START = 64
-_POINT_STRIDE = 12
-_COORD_MIN = 1.0
-_COORD_MAX = 10000.0   # generous page bound in points
-_WIDTH_MAX = 200.0     # sanity cap on the per-point width float
-
-# Highlighter / eraser curve geometry: the longest run of 0/1 flag bytes is
-# the boolean style array; the curve follows it immediately.
-_HL_FLAG_RUN_MIN = 20
-
-# Highlighter / eraser strokes have no per-point width; use a default.
-_HL_DEFAULT_WIDTH_PT = 10.0
-
-# Widthless marker/pen strokes (flag-run and stride-8 encodings store no
-# per-point width).  The reference draws these as thick marker swipes (~20 pt
-# page = ~36 canvas); the default is a mid-weight canvas value that keeps the
-# thin widthless black marks from bloating while making the colored markers
-# read as proper bands.
-_PEN_DEFAULT_WIDTH_PT = 20.0
-
-# Pencil strokes (grayscale + semi-transparent, widthless flag-run encoding)
-# fall back to _PEN_DEFAULT_WIDTH_PT, which smears them into fat ~11 pt bands.
-# The reference draws the gray pencil doodle at ~4 pt (pixel-density match:
-# 17568 vs 17615 ref gray px at 4 pt on the laptop region, vs 13922 at 2 pt).
-# Apply this only to gray, alpha<0.9 strokes — never to black marks (alpha 1.0)
-# or colored tape (not gray), which keep the thick default on purpose.
-_PENCIL_DEFAULT_WIDTH_PT = 4.0
-
-# Pencil strokes are pressure-sensitive: each stride-12 record stores
-# (x, y, pressure) where pressure (third float) is a 0..~1 per-point value.
-# GoodNotes renders the pencil width proportional to pressure.  Measured
-# against the reference (gray word strokes ~0.8-1.2 pt), the mapping
-#   width_canvas = _PENCIL_PRESSURE_GAIN * pressure
-# reproduces the reference stroke weight (median pressure ~0.45 -> ~4 canvas
-# units -> ~2.2 pt page).  A floor keeps the lightest taps visible.
-_PENCIL_PRESSURE_GAIN = 9.0
-_PENCIL_MIN_PRESSURE = 0.10
-
 # Shape outline width (canvas units) when f9.f15 is absent: the value every
 # shape in the samples carries.
 _SHAPE_DEFAULT_WIDTH = 10.3937
 
-
-# Marker strokes store a *uniform* width as a single float32 at byte 40 of the
-# decompressed geometry blob (after the "tpl\0"+length+style-template header).
-# A pen stroke has no such header (its bytes 40-43 are part of the template and
-# read as a huge, implausible float), so a sane range identifies a marker.
-_MARKER_WIDTH_OFFSET = 40
-_MARKER_WIDTH_MIN = 0.5
-_MARKER_WIDTH_MAX = 500.0
+# GoodNotes draws pencil as a grain texture, not flat ink.  Flat-colour output
+# approximates its average coverage with this opacity: a single pencil pass
+# covers 4-8 % of a solid stroke in the references (Test8, Test_11), dense
+# self-overlapping scribbles 30-40 % (Test6), because the texture accumulates.
+PENCIL_OPACITY = 0.2
 
 
 @dataclass
@@ -127,7 +85,8 @@ class Stroke:
     """One pen, highlighter, or eraser stroke.
 
     ``points`` is a list of ``(x, y, width)`` triples in canvas space.
-    ``kind`` is ``"pen"``, ``"highlighter"`` or ``"eraser"``.
+    ``kind`` is ``"pen"`` or ``"pencil"`` (a textured stroke whose colour
+    already carries the pencil opacity approximation).
     ``color`` is RGBA (0..1).  Eraser strokes are always white.
     ``fill`` is the RGBA interior colour of a filled (closed) shape, else None;
     writers paint it underneath the outline.
@@ -208,385 +167,10 @@ class GoodNotesDocument:
 # Geometry decoding
 # --------------------------------------------------------------------------- #
 
-def _f32(buf: bytes, o: int) -> float:
-    return struct.unpack_from("<f", buf, o)[0]
-
-
 def _bbox_diagonal(points) -> float:
     xs = [p[0] for p in points]
     ys = [p[1] for p in points]
     return ((max(xs) - min(xs)) ** 2 + (max(ys) - min(ys)) ** 2) ** 0.5
-
-
-def _valid_point(buf: bytes, o: int) -> bool:
-    """A pen point is float32 ``(x, y, width)``; gate on coordinates only."""
-    if o + _POINT_STRIDE > len(buf):
-        return False
-    x, y, w = _f32(buf, o), _f32(buf, o + 4), _f32(buf, o + 8)
-    return (_COORD_MIN < x < _COORD_MAX and _COORD_MIN < y < _COORD_MAX
-            and 0.0 <= w < _WIDTH_MAX)
-
-
-def _flag_run_end(buf: bytes) -> int:
-    """Return the offset just past the *first* long run of 0x00/0x01 bytes.
-
-    The flag-run pen encoding stores ``template + flag-run + [x0][y0][u32
-    count] + count*(x, y)``.  The style template before the flag run is ~30-48
-    bytes of floats; its bytes do not form a long 0x00/0x01 run, so the first
-    run of >= 30 flag bytes reliably marks the real array.  Returns the offset
-    one past that run's *end* (0 when there is none).
-    """
-    run = 0
-    for i in range(8, len(buf)):
-        if buf[i] in (0, 1):
-            run += 1
-        else:
-            if run >= 30:
-                return i
-            run = 0
-    if run >= 30:
-        return len(buf)
-    return 0
-
-
-def _stride8_scan(raw: bytes, start: int, max_gap: int = 3) -> List[Tuple[float, float, float]]:
-    """Collect stride-8 ``(x, y)`` pairs from ``start``, skipping isolated
-    invalid samples.
-
-    A single garbage sample used to *truncate* a path: a closed loop drawn as
-    ~132 stride-8 points had one bad pair mid-way, so the old "longest
-    contiguous run" reader returned only the first ~half (the "cut short"
-    defect).  We now skip up to ``max_gap - 1`` consecutive invalid samples,
-    then stop when a longer non-point stretch begins.  Coordinates are gated
-    to the page bound so trailing template bytes are not collected.
-    """
-    pts: List[Tuple[float, float, float]] = []
-    bad = 0
-    o = start
-    while o + 8 <= len(raw):
-        x, y = _f32(raw, o), _f32(raw, o + 4)
-        if _COORD_MIN < x < _COORD_MAX and _COORD_MIN < y < _COORD_MAX:
-            pts.append((x, y, 0.0))
-            bad = 0
-        else:
-            bad += 1
-            if bad >= max_gap:
-                break
-        o += 8
-    return pts
-
-
-def _points_after_flag(raw: bytes) -> List[Tuple[float, float, float]]:
-    """Decode a genuine flag-run (stride-8 / stride-16) stroke.
-
-    Layout: ``template + flag-run + [x0][y0][u32 count] + point array`` where
-    ``base = fe + 12`` starts the array.  Two point layouts exist, distinguished
-    by the buffer-length signature ``rem = len(raw) - base``:
-
-    * ``rem == 16·count`` — **stride-16**: each 16-byte record holds two smooth
-      points ``(x, y, x', y')``; emit both.  (Freehand ink strokes.)
-    * ``rem == 8·count``  — **stride-8**: ``count`` single ``(x, y)`` points.
-    * ``rem > 8·count``   — **stride-8, spurious count**: the stored count is a
-      mis-read (e.g. the loop's left edge), so collect *all* valid stride-8
-      pairs up to a short gap.  This is what fixed closed loops that were being
-      cut short at the first bad sample.
-
-    A spurious flag-run (no valid points at ``base``) returns ``[]`` so the
-    caller can fall through to the stride-12 pen layout.
-    """
-    fe = _flag_run_end(raw)
-    base = fe + 12
-    if base > len(raw):
-        return []
-    rem = len(raw) - base
-    count = struct.unpack("<I", raw[fe + 8:fe + 12])[0]
-
-    # Stride-16: each record holds two points.
-    if 0 < count < 10_000_000 and rem == 16 * count:
-        pts: List[Tuple[float, float, float]] = []
-        for i in range(count):
-            o = base + i * 16
-            if o + 16 > len(raw):
-                break
-            x1, y1 = _f32(raw, o), _f32(raw, o + 4)
-            x2, y2 = _f32(raw, o + 8), _f32(raw, o + 12)
-            if _COORD_MIN < x1 < _COORD_MAX and _COORD_MIN < y1 < _COORD_MAX:
-                pts.append((x1, y1, 0.0))
-            if _COORD_MIN < x2 < _COORD_MAX and _COORD_MIN < y2 < _COORD_MAX:
-                pts.append((x2, y2, 0.0))
-        return pts if len(pts) >= 2 else []
-
-    # Stride-8: the count may be a spurious read; collect all valid pairs.
-    pts8 = _stride8_scan(raw, base)
-    if len(pts8) < 2:
-        return []
-    if 2 <= count < len(pts8) and rem == 8 * count:
-        return pts8[:count]
-    return pts8
-
-
-def _longest_run(raw: bytes, stride: int, xoff: int, yoff: int,
-                 woff: int = -1) -> Tuple[int, int]:
-    """Return the ``(start, count)`` of the longest contiguous run of valid
-    coordinate samples at ``stride`` bytes, reading ``(x, y[, w])`` at the given
-    offsets.  ``woff`` -1 means no width is stored (stride‑8 / stride‑20)."""
-    n = len(raw)
-
-    def valid(o: int) -> bool:
-        if o + stride > n:
-            return False
-        x, y = _f32(raw, o + xoff), _f32(raw, o + yoff)
-        if not (_COORD_MIN < x < _COORD_MAX and _COORD_MIN < y < _COORD_MAX):
-            return False
-        if woff >= 0 and not (0.0 <= _f32(raw, o + woff) <= _WIDTH_MAX):
-            return False
-        return True
-
-    best_start, best_count, s = 0, 0, 0
-    while s + stride <= n:
-        if valid(s):
-            e = s
-            while valid(e):
-                e += stride
-            c = (e - s) // stride
-            if c > best_count:
-                best_start, best_count = s, c
-            s = e
-        else:
-            s += 1
-    return best_start, best_count
-
-
-def _stride12_widths_ok(raw: bytes, start: int, count: int) -> bool:
-    """True if a stride‑12 run carries plausible per‑point pen widths.
-
-    A genuine stride‑12 buffer stores a real width (a few points) in every
-    third float.  A *stride‑8* buffer read at stride 12 instead has its y
-    values land in the width slot, so the "widths" come out in the hundreds —
-    implausible.  This separates a thin pen (stride‑12) from a widthless
-    marker (stride‑8): the red bar's mis-read widths are ~100+, a real pen's
-    are ~1‑3.
-    """
-    for i in range(count):
-        w = _f32(raw, start + i * 12 + 8)
-        if w < 0.0 or w > 10.0:
-            return False
-    return True
-
-
-def _earliest_stride12(raw: bytes) -> Tuple[int, int]:
-    """Return ``(start, count)`` of the first run of >= 2 valid stride‑12
-    triplets at offset >= 64 (the original pen layout), else ``(0, 0)``."""
-    n = len(raw)
-    o = _POINT_SEARCH_START
-    while o + _POINT_STRIDE <= n:
-        if _valid_point(raw, o):
-            start = o
-            count = 0
-            while _valid_point(raw, o):
-                count += 1
-                o += _POINT_STRIDE
-            if count >= 2:
-                return start, count
-            o = start + _POINT_STRIDE
-        else:
-            o += 1
-    return 0, 0
-
-
-def _is_coherent(pts: List[Tuple[float, float, float]],
-                 max_median_jump: float = 40.0) -> bool:
-    """Reject a decoded path whose points are not spatially coherent.
-
-    A genuine pen/marker stroke is continuous: the median distance between
-    consecutive points is small (measured <= 14 canvas units across the
-    samples).  A *mis-decoded* blob (a template / wrong-phase buffer read as a
-    path) yields points that teleport around the page — the Test9 stroke i=108
-    has a median consecutive jump of ~712 units and paints a giant smudge.
-    Threshold of 40 sits comfortably above every real stroke (~14) and far
-    below a garbage path (~700).
-    """
-    if len(pts) < 8:
-        return True
-    jumps = []
-    for i in range(1, len(pts)):
-        dx = pts[i][0] - pts[i - 1][0]
-        dy = pts[i][1] - pts[i - 1][1]
-        jumps.append((dx * dx + dy * dy) ** 0.5)
-    jumps.sort()
-    return jumps[len(jumps) // 2] <= max_median_jump
-
-
-def extract_points(raw: bytes) -> List[Tuple[float, float, float]]:
-    """Extract the stroke path from decompressed pen geometry.
-
-    Layouts (checked in this order):
-      * **stride-12** ``(x, y, width)`` — a real pen, with plausible per-point
-        widths.  Checked *first* because a valid-width run is the most specific
-        signal: a spurious flag-run sitting before a stride-12 pen used to
-        steal it (the Test4 red stroke).
-      * **flag-run**  ``template + flag-run + [x0][y0][u32 count] + points`` —
-        a genuine widthless stroke (stride-8 / stride-16).  Taken when the
-        buffer length matches the stored count (or the count is a spurious
-        mis-read) and no valid stride-12 pen exists.
-      * **stride-8**  ``(x, y)`` — a widthless marker (the red bar), read via
-        the longest contiguous run when the flag-run signature doesn't hold.
-    """
-    s12, c12 = _earliest_stride12(raw)
-    if c12 >= 2 and _stride12_widths_ok(raw, s12, c12):
-        # A stride-12 pen/marker stores (x, y, width) records, but interleaves
-        # control / pen-up records every third slot, so a *contiguous* run is
-        # short even when the real path is long.  Read every stride-12 record
-        # at the anchor's phase and keep the valid ones, skipping the control
-        # records (this is what reconstructs the full red-tape band that
-        # ``_earliest_stride12``'s contiguous count would truncate to a dot).
-        pts: List[Tuple[float, float, float]] = []
-        bad = 0
-        o = s12
-        while o + _POINT_STRIDE <= len(raw):
-            # A real stride-12 record has plausible coordinates AND a plausible
-            # width.  The width gate matters: past the real path the phase
-            # mis-aligns and the *y* lands in the width slot (reads 30..200),
-            # so a width bound of 10 (matching ``_stride12_widths_ok``) both
-            # bridges the interleaved control records and stops before the junk.
-            w = _f32(raw, o + 8)
-            if _valid_point(raw, o) and 0.0 <= w <= 10.0:
-                # The stored per-point value is a half-width (radius): the
-                # reference marker/pen band is 2.00x the width that w*scale
-                # produces (e.g. the red tape stores 9.0 -> 4.91pt, but the
-                # reference renders it at 9.83pt).  Store the diameter so the
-                # emitter (w * scale) yields the true ink thickness.
-                pts.append((_f32(raw, o), _f32(raw, o + 4), w * 2.0))
-                bad = 0
-            else:
-                bad += 1
-                if bad > 3:  # control records appear at most every 3rd slot
-                    break
-            o += _POINT_STRIDE
-        if len(pts) >= 2:
-            return pts
-    # No valid stride-12 pen.  A genuine flag-run is identified by a buffer
-    # length that is a whole multiple of the per-record stride (8 or 16 bytes)
-    # times the stored count, or by a count too small to fill the buffer
-    # (spurious mis-read -> collect all valid pairs).
-    if _flag_run_end(raw):
-        pts = _points_after_flag(raw)
-        if len(pts) >= 2:
-            return pts
-    # Stride-8 widthless marker: longest contiguous (x, y) run.
-    s8, c8 = _longest_run(raw, 8, 0, 4)
-    if c8 >= 2:
-        return [(_f32(raw, s8 + i * 8), _f32(raw, s8 + i * 8 + 4), 0.0)
-                for i in range(c8)]
-    return []
-
-
-def extract_curve(raw: bytes) -> List[Tuple[float, float]]:
-    """Extract a highlighter / eraser / pencil smooth curve.
-
-    Points are stored as stride‑20 records ``[a, b, c, x, y]`` (five float32s,
-    x at +12, y at +16) — the first three floats are per‑sample style attributes
-    (pressure/velocity), the last two are the position.  The buffer carries a
-    style template and flag array before the path; we keep the *longest*
-    contiguous run of valid ``(x, y)`` samples.  A run must span real distance
-    (all‑zero "eraser" placeholders are dropped).
-    """
-    n = len(raw)
-    if n < 24:
-        return []
-
-    def valid(o: int) -> bool:
-        if o + 20 > n:
-            return False
-        x, y = _f32(raw, o + 12), _f32(raw, o + 16)
-        return 1.0 < x < 5000.0 and 1.0 < y < 5000.0
-
-    best_start = best_len = 0
-    s = 0
-    while s < n:
-        if valid(s):
-            e = s
-            while valid(e):
-                e += 20
-            if e - s > best_len:
-                best_start, best_len = s, e - s
-            s = e
-        else:
-            s += 1
-    count = best_len // 20
-    if count < 2:
-        return []
-    pts = [(_f32(raw, best_start + i * 20 + 12),
-            _f32(raw, best_start + i * 20 + 16)) for i in range(count)]
-    xs = [p[0] for p in pts]
-    ys = [p[1] for p in pts]
-    if (max(xs) - min(xs)) < 0.5 and (max(ys) - min(ys)) < 0.5:
-        return []  # degenerate (all-zero placeholder)
-    return pts
-
-
-def extract_pencil(raw: bytes) -> List[Tuple[float, float, float]]:
-    """Extract a pressure-sensitive *pencil* path from its geometry blob.
-
-    The pencil stores stride-12 records ``(x, y, pressure)`` — the third float
-    is the per-point pressure, i.e. the per-point width (the pencil is
-    pressure-sensitive, unlike the uniform-width highlighter).  Real anchor
-    points sit at a fixed phase and have plausible canvas coordinates
-    (``1 < x, y``); the interleaved control / Bézier-handle records carry
-    ``x < 1`` or ``y < 1`` and are skipped.  ``extract_curve`` (stride-20) and
-    ``extract_points`` both mis-read this layout (they read the wrong floats /
-    break at the control records), returning only a few far-apart points that
-    the emitter connects into giant chords.  We instead scan for contiguous
-    runs of valid stride-12 anchors and return ``(x, y, pressure)`` triples in
-    drawing order.
-    """
-    n = len(raw)
-    if n < 24:
-        return []
-
-    def anchor(o: int) -> Optional[Tuple[float, float, float]]:
-        if o + _POINT_STRIDE > n:
-            return None
-        x, y, p = _f32(raw, o), _f32(raw, o + 4), _f32(raw, o + 8)
-        # Real anchors sit well inside the canvas.  The stride-12 array also
-        # carries spurious pen-state / reset records with tiny near-origin
-        # coordinates (x, y ~ 1-3); letting those through connects the stroke
-        # to the top-left corner and draws a giant chord.  A floor of 5 (the
-        # canvas corner is off-page, so no real anchor ever lands there) drops
-        # them without touching genuine points.
-        if not (5.0 < x < 1600.0 and 5.0 < y < 1600.0):
-            return None
-        # A real pencil anchor always carries positive pressure (min ~0.046 in
-        # practice).  Reset / pen-lift sentinel records carry pressure ~0 (a
-        # subnormal float), e.g. a stray (58, 98) point; including one connects
-        # the stroke to it and draws a giant diagonal chord.  Require a
-        # minimum pressure to drop those sentinels.
-        if not (0.02 <= p < 3.0):
-            return None
-        return x, y, p
-
-    pts: List[Tuple[float, float, float]] = []
-    s = 0
-    while s + _POINT_STRIDE <= n:
-        a = anchor(s)
-        if a is None:
-            s += 1
-            continue
-        e = s
-        while anchor(e) is not None:
-            e += _POINT_STRIDE
-        for i in range((e - s) // _POINT_STRIDE):
-            a = anchor(s + i * _POINT_STRIDE)
-            if a is not None:
-                pts.append(a)
-        s = e
-    if len(pts) < 2:
-        return []
-    xs = [p[0] for p in pts]
-    ys = [p[1] for p in pts]
-    if (max(xs) - min(xs)) < 0.5 and (max(ys) - min(ys)) < 0.5:
-        return []  # degenerate (all-zero placeholder)
-    return pts
 
 
 def _stroke_origin(content_fields) -> Optional[Tuple[float, float]]:
@@ -735,136 +319,42 @@ def _rtf_to_plain(rtf: bytes) -> str:
 # Page / archive parsing
 # --------------------------------------------------------------------------- #
 
-def _marker_width(raw: bytes) -> Optional[float]:
-    """Return the marker's uniform width (canvas units) if the buffer holds a
-    marker width float at byte 40, else ``None``.
+def _parse_stroke(cf) -> List[Stroke]:
+    """Build the stroke(s) of a kind-7 object (one per sub-path).
 
-    Marker strokes (and the flag-run/stride-8 layouts) carry one uniform width
-    as a float32 at offset 40 of the decompressed blob, right after the
-    "tpl\\0"+length+style-template header.  Pen strokes have no such header —
-    bytes 40-43 there are template data that decode to a huge, implausible
-    float — so a sane range (0.5..500 canvas units) identifies a marker.
+    A shape-recognised stroke keeps its exact geometry in ``f9`` (its ``f2``
+    blob is then a bare style template); a freehand stroke has an empty
+    ``f9`` and its path in the ``f2`` blob (see :mod:`goodparse.ink`).  Either
+    way the ``f6`` translation of a moved object is added to every point.
     """
-    if len(raw) < _MARKER_WIDTH_OFFSET + 4:
-        return None
-    w = _f32(raw, _MARKER_WIDTH_OFFSET)
-    if _MARKER_WIDTH_MIN <= w <= _MARKER_WIDTH_MAX:
-        return w
-    return None
-
-
-def _is_pencil(color) -> bool:
-    """True for a GoodNotes *pencil* stroke: grayscale and semi-transparent.
-
-    Pencil ink is stored as gray (r == g == b) at alpha ~0.5, and uses the
-    widthless flag-run encoding (no offset-40 width, no per-point width).  This
-    separates it from black marks (alpha ~1.0) and colored tape (not gray), so
-    only pencil gets the thin width.  (A black marker has alpha 1.0; a colored
-    tape has r != g != b.)
-    """
-    r, g, b, a = color
-    return abs(r - g) < 0.02 and abs(g - b) < 0.02 and a < 0.9
-
-
-def _parse_stroke(cf, scale: float = 1.0) -> Optional[Stroke]:
-    """Build a Stroke from a field ``#7`` content message."""
-    blob = _find_geometry_blob(cf)
-    raw = apple_decompress(blob) if blob is not None else None
     color = _extract_color(cf)
-    tool_id = cf.get(21, [None])[0]
+    dx, dy = _stroke_origin(cf) or (0.0, 0.0)
 
-    # Shape-recognised strokes keep their exact geometry in f9 (the f2 blob is
-    # only the style template).  An empty f9 means a freehand stroke.
     f9 = cf.get(9, [b""])[0]
     if isinstance(f9, (bytes, bytearray)) and f9:
         outline = decode_outline(bytes(f9))
         if outline:
             w = outline_width(bytes(f9)) or _SHAPE_DEFAULT_WIDTH
-            # A moved shape keeps its original geometry plus a translation in
-            # f6, exactly like a moved freehand stroke.
-            dx, dy = _stroke_origin(cf) or (0.0, 0.0)
-            return Stroke(points=[(x + dx, y + dy, w) for x, y in outline.points],
-                          color=color, kind="pen")
+            return [Stroke(points=[(x + dx, y + dy, w) for x, y in outline.points],
+                           color=color, kind="pen")]
 
-    if tool_id == 25 and raw is not None:
-        # Pencil: dense pressure-sensitive stride-12 (x, y, pressure) records.
-        # The third float is the per-point pressure -> per-point width.
-        ppts = extract_pencil(raw)
-        if not ppts:
-            # Fall back to the legacy highlighter/curve layout (some builds).
-            pts = extract_curve(raw)
-            if not pts:
-                return None
-            w = _HL_DEFAULT_WIDTH_PT
-            return Stroke(points=[(x, y, w) for x, y in pts], color=color,
-                          kind="highlighter")
-        # pressure (0..~1) -> canvas-unit width; store so the emitter ×scale.
-        per_pt = []
-        for x, y, p in ppts:
-            w = max(_PENCIL_PRESSURE_GAIN * p,
-                    _PENCIL_PRESSURE_GAIN * _PENCIL_MIN_PRESSURE)
-            per_pt.append((x, y, w))
-        return Stroke(points=per_pt, color=color, kind="pen")
-
-    pts = extract_points(raw) if raw is not None else []
-    # A blob that decodes into a spatially incoherent scatter (points teleport
-    # hundreds of units between consecutive samples) is a mis-read template,
-    # not a real stroke — e.g. Test9 i=108, which paints a giant page-spanning
-    # smudge.  Drop it rather than emit the artifact.
-    if pts and not _is_coherent(pts):
-        return None
-    # Fountain-pen / pressure strokes in the latest build carry their points as
-    # repeated field-#4 point messages ({1: x, 2: y}, no per-point width) rather
-    # than an LZ4 blob.  A single uniform width float lives in field #6.  Only
-    # fall back to this when there is no LZ4 geometry (raw is None), so the
-    # colour blob in #4 of a normal stroke is never mistaken for points.
-    if not pts and raw is None:
-        f4_pts = []
-        for p in cf.get(4, []):
-            if not isinstance(p, (bytes, bytearray)):
-                continue
-            xy = _point_xy(bytes(p))
-            if xy:
-                f4_pts.append(xy)
-        if len(f4_pts) >= 2:
-            f6 = cf.get(6, [None])[0]
-            w_canvas = (float(f6) if isinstance(f6, float) and 0.05 < f6 < 200
-                        else _PEN_DEFAULT_WIDTH_PT)
-            origin = _stroke_origin(cf)
-            if origin is not None:
-                f4_pts = [(x + origin[0], y + origin[1]) for x, y in f4_pts]
-            # This layout keeps its points in #4, so _extract_color (which reads
-            # #4 as RGBA) is wrong here.  The stroke carries no per-point RGBA;
-            # its ink is the tool's stored colour, approximated as a dark gray.
-            fp_color = (0.30, 0.30, 0.30, 1.0)
-            return Stroke(points=[(x, y, w_canvas) for x, y in f4_pts],
-                          color=fp_color, kind="pen")
-    if not pts:
-        return None
-    # If the buffer carries a marker width float (offset 40) use it — GoodNotes
-    # markers have a single uniform width; otherwise fall back to the default pen width.
-    if all(w == 0.0 for _x, _y, w in pts):
-        mw = _marker_width(raw)
-        if mw is not None and scale > 0:
-            # offset-40 value × 0.25 = rendered page-pt (calibrated against
-            # Test7's three known marker lines); store canvas units so the PDF
-            # emitter's ×scale yields the right page thickness.
-            w_canvas = mw * 0.25 / scale
-        elif _is_pencil(color):
-            # Grayscale, semi-transparent, widthless = the pencil.  Thin it
-            # down from the fat marker default so the gray doodle doesn't smear.
-            w_canvas = (_PENCIL_DEFAULT_WIDTH_PT / scale) if scale > 0 else _PENCIL_DEFAULT_WIDTH_PT
-        else:
-            w_canvas = _PEN_DEFAULT_WIDTH_PT
-        pts = [(x, y, w_canvas) for x, y, _w in pts]
-    # Grouped strokes store their points relative to a per-stroke origin held
-    # in field #6 (a nested {1: x, 2: y} float32 message); add it back.
-    origin = _stroke_origin(cf)
-    if origin is not None:
-        pts = [(x + origin[0], y + origin[1], w) for x, y, w in pts]
-    # f10 (a second UUID) marks strokes on a shared layer/group — it is NOT an
-    # eraser flag; the stroke keeps its own stored colour.
-    return Stroke(points=pts, color=color, kind="pen")
+    blob = _find_geometry_blob(cf)
+    if blob is None:
+        return []
+    try:
+        ink = decode_ink(apple_decompress(blob))
+    except TemplateError as exc:
+        warnings.warn(f"skipping undecodable stroke: {exc}")
+        return []
+    if ink is None:
+        return []
+    kind = "pen"
+    if ink.kind == "pencil":
+        kind = "pencil"
+        color = (color[0], color[1], color[2], color[3] * PENCIL_OPACITY)
+    return [Stroke(points=[(x + dx, y + dy, w) for x, y, w in path],
+                   color=color, kind=kind)
+            for path in ink.subpaths]
 
 
 def parse_page(data: bytes, attachments: Dict[str, bytes],
@@ -885,10 +375,10 @@ def parse_page(data: bytes, attachments: Dict[str, bytes],
     fills: List[PageObject] = []
     for obj in read_page_objects(data):
         if obj.kind == KIND_STROKE:
-            stroke = _parse_stroke(obj.fields, scale=page.scale)
-            if stroke:
-                page.strokes.append(stroke)
-                by_id[obj.id] = stroke
+            strokes = _parse_stroke(obj.fields)
+            page.strokes.extend(strokes)
+            if strokes:
+                by_id[obj.id] = strokes[0]
         elif obj.kind == KIND_FILL:
             fills.append(obj)
         elif obj.kind == KIND_IMAGE:
