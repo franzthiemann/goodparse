@@ -15,8 +15,11 @@ for text.
 ## Install
 
 ```bash
-pip install -e .
+pip install goodparse                 # or, for real-font embedding in PDFs:
+pip install "goodparse[pdf-fonts]"
 ```
+
+From a checkout: `pip install -e .`
 
 ## Usage
 
@@ -104,7 +107,7 @@ is a two-tier strategy:
   base-14 family — **Times** for serif families (e.g. `Georgia`), **Courier**
   for monospace ones (e.g. `Courier New`), **Helvetica** otherwise — placed
   with those fonts' real advance widths
-  ([`base14_widths.py`](src/goodparse/base14_widths.py)). This always works
+  ([`base14_widths.py`](https://github.com/franzthiemann/goodparse/blob/main/src/goodparse/base14_widths.py)). This always works
   and keeps the converter dependency-free; the glyphs are close but not a
   pixel match for other faces.
 - **Optional embedding (when the font is present):** if the named family can be
@@ -134,7 +137,7 @@ the clone isn't installed, or `fontTools` is absent, the converter silently uses
 the base-14 fallback — the output is still valid, just with the stand-in face.
 
 Placement is shared by all three output formats
-([`textlayout.py`](src/goodparse/textlayout.py)). RTF text boxes are inset
+([`textlayout.py`](https://github.com/franzthiemann/goodparse/blob/main/src/goodparse/textlayout.py)). RTF text boxes are inset
 like UIKit text views: the text starts 10 canvas units inside the box's left
 and right edges (it also wraps there) and its first baseline sits
 `8 + 1.04 x size` below the box top — measured on every RTF box of the
@@ -154,7 +157,7 @@ exports (`samples/*.pdf`).
 | `index.events.pb` | document event log: page creation, order, paper, deletion |
 | `index.notes.pb` | list of page members |
 
-**Page object log** ([`records.py`](src/goodparse/records.py)). Each object is a
+**Page object log** ([`records.py`](https://github.com/franzthiemann/goodparse/blob/main/src/goodparse/records.py)). Each object is a
 *header* record (object UUID, version, `f3 = 1` when **deleted**) followed by a
 *body* record whose single field number is the object kind: `7` stroke/shape,
 `9` shape fill, `8` RTF text box, `21` text object, `1` image placement,
@@ -166,9 +169,9 @@ notebooks) or else `f4`.
 Deleted objects stay in the file and must be skipped. A moved object keeps its
 geometry and stores the move as a translation in `f6`.
 
-**Stroke paths** ([`ink.py`](src/goodparse/ink.py)). The stroke's `f2` is an
+**Stroke paths** ([`ink.py`](https://github.com/franzthiemann/goodparse/blob/main/src/goodparse/ink.py)). The stroke's `f2` is an
 Apple `libcompression` LZ4 blob (`bv41`…`bv4$`, decoder in
-[`applelz4.py`](src/goodparse/applelz4.py)) that decompresses to a
+[`applelz4.py`](https://github.com/franzthiemann/goodparse/blob/main/src/goodparse/applelz4.py)) that decompresses to a
 **self-describing container**: `tpl\0`, a length, a type signature such as
 `vuA(v)A(S(uu))A(S(uuuu))vA(f)` (`v` u16, `u`/`f` 32-bit, `A(…)` counted array,
 `S(…)` struct, tightly packed), then the values. Five signatures cover every
@@ -178,19 +181,19 @@ flags (move / quadratic segment) plus points; the segments are midpoint
 quadratic smoothing of the raw pen samples, so the drawn curve is the
 quadratic Bézier.
 
-**Vector shapes and fills** ([`shapes.py`](src/goodparse/shapes.py)). A
+**Vector shapes and fills** ([`shapes.py`](https://github.com/franzthiemann/goodparse/blob/main/src/goodparse/shapes.py)). A
 shape-recognised stroke keeps exact geometry in `f9`: `f1` polygon, `f2`
 quadratic curve, `f3` rectangle (centre + size + rotation), `f4` ellipse
 (centre + semi-axes + rotation). A fill object references its outline by UUID
 and carries the fill RGBA.
 
-**Text** ([`richtext.py`](src/goodparse/richtext.py),
-[`text_rtf.py`](src/goodparse/text_rtf.py)). Text objects hold an LZ4 run blob
+**Text** ([`richtext.py`](https://github.com/franzthiemann/goodparse/blob/main/src/goodparse/richtext.py),
+[`text_rtf.py`](https://github.com/franzthiemann/goodparse/blob/main/src/goodparse/text_rtf.py)). Text objects hold an LZ4 run blob
 (per-run text, colour, font family, size, weight, italic, underline,
 strikethrough; per-paragraph alignment and list style, with `-404` meaning "inherit the default"). Older
 text boxes hold Cocoa RTF.
 
-**Pages** ([`archive.py`](src/goodparse/archive.py)). Page properties in the
+**Pages** ([`archive.py`](https://github.com/franzthiemann/goodparse/blob/main/src/goodparse/archive.py)). Page properties in the
 event log are versioned registers: each page has a paper layer (which gives
 its canvas size, its paper PDF and — for imported documents — the page of a
 multi-page paper PDF) and a **fractional-index position key**; moving
@@ -215,7 +218,7 @@ against GoodNotes' own export and fails on any regression.
 Known gaps:
 
 - **"Start typing" text** is laid out from measured rules
-  ([`flowtext.py`](src/goodparse/flowtext.py)); GoodNotes breaks some heading
+  ([`flowtext.py`](https://github.com/franzthiemann/goodparse/blob/main/src/goodparse/flowtext.py)); GoodNotes breaks some heading
   lines earlier than their width requires, which is not reproduced yet.
 - GoodNotes' regular PDF export drops the indentation of "start typing" text
   (a GoodNotes bug); the visual tests therefore prefer a flattened export
