@@ -1380,26 +1380,55 @@ def _read_page_meta(opener, names, member_names) -> List[Tuple[str, str,
             if not prev or not prev[1]:
                 layer_info[layer] = (paper, prev[1] if prev else None)
 
-    # 2) page order: f54 create ops (page UUID f2, layer f3).
+    # 2) pages: f54 create ops (page UUID f2, layer f3, position key f4).
+    #    Display order is NOT creation order: each page carries a
+    #    fractional-index position key (``f4 = {1: key, 2: {1: version}}``,
+    #    e.g. "4mgFG1" < "Am5Pm" < "L2FtP" < "O9t!N"), and moving a page
+    #    rewrites it through an f55 update op (``f3`` = new key, same layout).
+    #    Pages sort by their latest key, bytewise.
     member_prefix = {p32: m for p32, m in
                      ((m[-36:][:32], m) for m in member_names)}
-    out: List[Tuple[str, str, Optional[Tuple[float, float]], Optional[str]]] = []
+    created: List[Tuple[str, Optional[str]]] = []  # (page UUID, layer)
+    position: Dict[str, Tuple[int, bytes]] = {}    # page -> (version, key)
     for rec in recs:
         t = parse_message_tolerant(rec)
-        if 54 not in t:
-            continue
-        page = layer = None
-        for f, _wt, v in iter_fields_tolerant(t[54][0]):
-            if f == 2:
-                page = _uuid_from(v) or page
-            elif f == 3:
-                layer = _uuid_from(v) or layer
-        if not page:
-            continue
+        for op, key_field in ((54, 4), (55, 3)):
+            if op not in t or not isinstance(t[op][0], (bytes, bytearray)):
+                continue
+            body = parse_message_tolerant(t[op][0])
+            page = _uuid_from(body.get(2, [None])[0])
+            if not page:
+                continue
+            if op == 54:
+                created.append((page, _uuid_from(body.get(3, [None])[0])))
+            pk = _position_key(body.get(key_field, [None])[0])
+            if pk and pk[0] >= position.get(page, (-1, b""))[0]:
+                position[page] = pk
+    out: List[Tuple[str, str, Optional[Tuple[float, float]], Optional[str]]] = []
+    for page, layer in created:
         member = member_prefix.get(page[:32])
         paper, cxy = layer_info.get(layer, (None, None)) if layer else (None, None)
         out.append((member, layer, cxy, paper))
-    return out
+    # Stable sort: pages without a key keep their creation order at the front.
+    order = {page: position.get(page, (0, b""))[1] for page, _l in created}
+    keyed = sorted(range(len(out)), key=lambda i: order[created[i][0]])
+    return [out[i] for i in keyed]
+
+
+def _position_key(msg) -> Optional[Tuple[int, bytes]]:
+    """Decode a page position ``{1: key bytes, 2: {1: version}}``."""
+    if not isinstance(msg, (bytes, bytearray)):
+        return None
+    f = parse_message_tolerant(bytes(msg))
+    key = f.get(1, [None])[0]
+    if not isinstance(key, (bytes, bytearray)) or not key:
+        return None
+    ver = f.get(2, [None])[0]
+    version = 0
+    if isinstance(ver, (bytes, bytearray)):
+        v = parse_message_tolerant(bytes(ver)).get(1, [0])[0]
+        version = v if isinstance(v, int) else 0
+    return version, bytes(key)
 
 
 def _collect_attachments(opener, names) -> Dict[str, bytes]:

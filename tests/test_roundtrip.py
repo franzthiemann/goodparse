@@ -546,3 +546,12 @@ def test_fill_reaches_xopp_and_excalidraw(tmp_path):
     els = json.loads(out.read_text())["elements"]
     fills = [e for e in els if e["id"].endswith("-fill")]
     assert len(fills) == 4 and all(e["opacity"] == 10 for e in fills)
+
+
+def test_page_order_follows_position_keys_not_creation():
+    # Test9's A4 form page was created last but inserted before the strip
+    # page (position key "L2FtP" < "O9t!N").
+    doc = parse_goodnotes(sample("Test9.goodnotes"))
+    sizes = [(round(p.width), round(p.height)) for p in doc.pages]
+    assert sizes[5] == (595, 842)
+    assert sizes[6] == (455, 143)
