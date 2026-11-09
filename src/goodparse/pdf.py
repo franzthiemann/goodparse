@@ -403,10 +403,6 @@ def _page_content(page, width_scale: float, alpha_name: Dict[float, str],
     """
     s = page.scale
     h = page.height
-    # NOTE: the round cap/join (J/j) is emitted *per stroke*, just before that
-    # stroke's width, not here.  pypdfium2/Skia drops the stroke colour to
-    # black when a J or j operator appears *immediately before* an ``RG``;
-    # keeping a ``w`` between them avoids that (see the per-stroke emission).
     out: List[str] = []
     xrefs: List[str] = []
     img_bodies: Dict[int, bytes] = {}
@@ -481,29 +477,15 @@ def _page_content(page, width_scale: float, alpha_name: Dict[float, str],
                 out.append(f"{_num(x * s, 2)} {_num(h - y * s, 2)} l")
             out.append("h f")
             out.append("Q")
-        # Emission order matters: caps (J/j) must be separated from ``RG`` by
-        # a ``w``.  pypdfium2/Skia renders the stroke black when a cap/join
-        # operator appears immediately before the colour, so go
-        # caps -> width -> colour -> path.
-        #
-        # Each stroke is wrapped in a graphics-state save/restore (q … Q) so
-        # the alpha ExtGState set for a translucent stroke (pencil / tape /
-        # highlighter at alpha < 1) cannot *leak* to the next stroke.  Without
-        # it, every subsequent opaque stroke inherits the 0.5 alpha and renders
-        # as a faint gray band over the grid (the "gray ovals / too-transparent
-        # triangle" bug).  q/Q also isolates the per-stroke width/caps.
-        out.append("q")
-        out.append("J 1")
-        out.append("j 1")
-        # A uniform-width stroke is one continuous path: 131 overlapping
-        # per-segment round caps would blend to a muddy grey under alpha (and
-        # produce the "highlighter rectangles" artifact).  Only a pressure
-        # (width-varying) stroke needs per-segment paths, and even then only
-        # where the width actually changes.
+        # Each stroke is wrapped in q … Q so its alpha ExtGState, width and
+        # caps cannot leak into the next stroke.  Round caps and joins (PDF
+        # operators are postfix: ``1 J 1 j``) give GoodNotes' rounded ends and
+        # let the per-segment pieces of a pressure stroke blend seamlessly.
+        out.append("q 1 J 1 j")
+        # A uniform-width stroke is one continuous path: overlapping
+        # per-segment round caps would double up under alpha.  Only a
+        # width-varying (pressure) stroke is drawn segment by segment.
         uniform = max(widths) - min(widths) < 1e-6
-        # Always emit a width before ``RG`` so the caps above are separated
-        # from the colour; for a pressure stroke this is just a lead-in
-        # (each segment below sets its own width).
         out.append(f"{_num(widths[0])} w")
         out.append(f"{_num(r)} {_num(g)} {_num(b)} RG")
         if a < 1.0:

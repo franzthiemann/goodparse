@@ -256,7 +256,7 @@ def test_pdf_synthetic_structure_and_yflip(tmp_path):
     # segment width = mean(1,2) = 1.5
     assert b"1.5 w" in c1
     # round caps/joins set
-    assert b"J 1" in c1 and b"j 1" in c1
+    assert b"1 J 1 j" in c1  # postfix operators: round caps + joins
 
     # --- ExtGState for the semi-transparent green stroke -------------------
     # page 2 content is obj 6; its resources must reference GS0
