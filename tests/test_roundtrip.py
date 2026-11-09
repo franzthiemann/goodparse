@@ -475,3 +475,74 @@ def test_embedded_font_falls_back_to_base14_without_fonts(tmp_path, monkeypatch)
     assert b"/Helvetica-Bold" in data
     entries, size, _ = _xref_offsets(data)
     assert size == 1 + len(_objects(data))
+
+
+# --------------------------------------------------------------------------- #
+# Object log, vector shapes and fills (Test8, Test_11)
+# --------------------------------------------------------------------------- #
+
+def test_deleted_objects_are_not_drawn():
+    # Test8 page 1 holds a live square + circle; two deleted shapes remain in
+    # the file as tombstones (header f3 = 1) and must not be drawn.
+    doc = parse_goodnotes(sample("Test8.goodnotes"))
+    assert len(doc.pages[0].strokes) == 2
+
+
+def test_rectangle_and_ellipse_geometry_colour_and_fill():
+    doc = parse_goodnotes(sample("Test8.goodnotes"))
+    square, circle = sorted(doc.pages[0].strokes, key=lambda s: len(s.points))
+    xs = [p[0] for p in square.points]
+    ys = [p[1] for p in square.points]
+    # f9.f3 = centre (210.97, 207.26) + full size 246.2 (canvas units)
+    assert (min(xs) + max(xs)) / 2 == pytest.approx(210.97, abs=0.01)
+    assert (min(ys) + max(ys)) / 2 == pytest.approx(207.26, abs=0.01)
+    assert max(xs) - min(xs) == pytest.approx(246.20, abs=0.01)
+    assert square.color[:3] == pytest.approx((0.0, 0.4784, 1.0), abs=1e-3)
+    assert square.fill == pytest.approx((0.0, 0.4784, 1.0, 0.1), abs=1e-3)
+    # f9.f4 = centre + semi-axes: a circle of radius 176.32
+    cx, cy = 506.27, 584.78
+    radii = [((x - cx) ** 2 + (y - cy) ** 2) ** 0.5 for x, y, _w in circle.points]
+    assert min(radii) == pytest.approx(176.32, abs=0.05)
+    assert max(radii) == pytest.approx(176.32, abs=0.05)
+    assert circle.color[0] == pytest.approx(0.8235, abs=1e-3)
+    assert circle.fill is not None and circle.fill[3] == pytest.approx(0.1)
+
+
+def test_bezier_shape_is_quadratic():
+    from goodparse.shapes import decode_outline
+
+    def pt(x, y):
+        import struct
+        return b"\x0d" + struct.pack("<f", x) + b"\x15" + struct.pack("<f", y)
+
+    def msg(field, payload):
+        return bytes([field << 3 | 2, len(payload)]) + payload
+
+    curve = msg(1, pt(0, 0)) + msg(2, pt(50, 100)) + msg(3, pt(100, 0))
+    out = decode_outline(msg(2, curve))
+    assert out is not None and not out.closed
+    apex = max(out.points, key=lambda p: p[1])
+    assert apex == pytest.approx((50.0, 50.0))  # B(0.5) = (p0 + 2 p1 + p2) / 4
+
+
+def test_moved_shape_applies_translation():
+    # Test_11 page 2: the circle was moved; its f6 translation (-4.95, 238.46)
+    # is added to the stored geometry (centre 246.88, 209.74).
+    doc = parse_goodnotes(sample("Test_11.goodnotes"))
+    circle = next(s for s in doc.pages[1].strokes if s.fill is not None)
+    xs = [p[0] for p in circle.points]
+    ys = [p[1] for p in circle.points]
+    assert (min(xs) + max(xs)) / 2 == pytest.approx(246.88 - 4.95, abs=0.05)
+    assert (min(ys) + max(ys)) / 2 == pytest.approx(209.74 + 238.46, abs=0.05)
+
+
+def test_fill_reaches_xopp_and_excalidraw(tmp_path):
+    out = tmp_path / "t8.xopp"
+    convert_file(sample("Test8.goodnotes"), str(out))
+    xml = gzip.open(out).read().decode()
+    assert xml.count(' fill="26"') == 4  # alpha 0.1 * 255
+    out = tmp_path / "t8.excalidraw"
+    convert_file(sample("Test8.goodnotes"), str(out))
+    els = json.loads(out.read_text())["elements"]
+    fills = [e for e in els if e["id"].endswith("-fill")]
+    assert len(fills) == 4 and all(e["opacity"] == 10 for e in fills)

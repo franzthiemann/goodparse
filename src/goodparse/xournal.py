@@ -29,7 +29,6 @@ from xml.sax.saxutils import escape
 from .goodnotes import (
     GoodNotesDocument,
     Image,
-    Page,
     Stroke,
     TextBox,
 )
@@ -80,11 +79,20 @@ def _width_attr(points, scale: float) -> str:
 
 
 def _stroke_xml(stroke: Stroke, scale: float, width_scale: float) -> str:
+    """Emit a ``<stroke>``; widths are canvas units, so they take the page
+    scale as well as the user's ``width_scale``.
+
+    A filled shape gets Xournal++'s ``fill`` attribute (fill opacity 0..255);
+    Xournal++ fills with the stroke colour, which is what GoodNotes uses too.
+    """
     points = _stroke_points(stroke, scale)
     color = color_to_hex(stroke.color)
     coords = " ".join(f"{_fmt(x)} {_fmt(y)}" for x, y, _w in points)
-    width = _width_attr(points, width_scale)
-    return f'<stroke tool="pen" color="{color}" width="{width}">{coords}</stroke>'
+    width = _width_attr(points, scale * width_scale)
+    fill = ""
+    if stroke.fill is not None:
+        fill = f' fill="{round(max(0.0, min(1.0, stroke.fill[3])) * 255)}"'
+    return f'<stroke tool="pen" color="{color}"{fill} width="{width}">{coords}</stroke>'
 
 
 def _natural_size(data: bytes) -> Tuple[int, int]:

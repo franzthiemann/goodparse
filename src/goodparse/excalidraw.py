@@ -101,14 +101,54 @@ def _stroke_points(stroke: Stroke) -> List[Tuple[float, float, float]]:
     return pts
 
 
-def _freedraw_element(stroke: Stroke, element_id: str, index: int,
-                      offset_y: float, scale: float) -> dict:
+def _page_xy(stroke: Stroke, offset_y: float, page_scale: float):
+    """Stroke points in scene coordinates: canvas -> page, then page offset."""
     points = _stroke_points(stroke)
-    widths = [max(_MIN_WIDTH, w * scale) for _x, _y, w in points]
+    xs = [p[0] * page_scale for p in points]
+    ys = [p[1] * page_scale + offset_y for p in points]
+    return points, xs, ys
+
+
+def _fill_element(stroke: Stroke, element_id: str, index: int,
+                  offset_y: float, page_scale: float) -> dict:
+    """A closed, stroke-less ``line`` polygon carrying a shape's fill.
+
+    Excalidraw has a single opacity per element, so the translucent fill is
+    its own element beneath the (opaque) outline.
+    """
+    assert stroke.fill is not None
+    _points, xs, ys = _page_xy(stroke, offset_y, page_scale)
+    x0, y0 = min(xs), min(ys)
+    rel = [[round(x - x0, 4), round(y - y0, 4)] for x, y in zip(xs, ys)]
+    rel.append(rel[0])
+    el = _base_element(element_id, index)
+    el.update({
+        "type": "line",
+        "x": x0,
+        "y": y0,
+        "width": max(xs) - x0,
+        "height": max(ys) - y0,
+        "strokeColor": "transparent",
+        "backgroundColor": color_to_rgb_hex(stroke.fill),
+        "strokeWidth": 1,
+        "opacity": _opacity(stroke.fill),
+        "points": rel,
+        "lastCommittedPoint": None,
+        "startBinding": None,
+        "endBinding": None,
+        "startArrowhead": None,
+        "endArrowhead": None,
+    })
+    return el
+
+
+def _freedraw_element(stroke: Stroke, element_id: str, index: int,
+                      offset_y: float, width_scale: float,
+                      page_scale: float = 1.0) -> dict:
+    points, xs, ys = _page_xy(stroke, offset_y, page_scale)
+    widths = [max(_MIN_WIDTH, w * page_scale * width_scale) for _x, _y, w in points]
     nominal = max(widths)
 
-    xs = [p[0] for p in points]
-    ys = [p[1] + offset_y for p in points]
     x0, y0 = min(xs), min(ys)
     rel = [[round(x - x0, 4), round(y - y0, 4)] for x, y in zip(xs, ys)]
 
@@ -139,10 +179,12 @@ def build_scene(doc: GoodNotesDocument, width_scale: float = 1.0) -> dict:
         elements.append(_page_frame(page_index, len(elements), offset_y,
                                     page.width, page.height))
         for stroke_index, stroke in enumerate(page.strokes):
+            sid = f"p{page_index + 1}-s{stroke_index + 1}"
+            if stroke.fill is not None:
+                elements.append(_fill_element(
+                    stroke, sid + "-fill", len(elements), offset_y, page.scale))
             elements.append(_freedraw_element(
-                stroke, f"p{page_index + 1}-s{stroke_index + 1}",
-                len(elements), offset_y, width_scale,
-            ))
+                stroke, sid, len(elements), offset_y, width_scale, page.scale))
         offset_y += page.height + PAGE_GAP
     return {
         "type": "excalidraw",

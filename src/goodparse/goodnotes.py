@@ -34,7 +34,6 @@ RTF source (Cocoa RTF), and another is the RGBA colour.
 
 from __future__ import annotations
 
-import math
 import os
 import re
 import struct
@@ -51,6 +50,7 @@ from .protobuf import (
     read_length_delimited_records,
 )
 from .records import (
+    KIND_FILL,
     KIND_IMAGE,
     KIND_STROKE,
     KIND_TEXT,
@@ -58,6 +58,7 @@ from .records import (
     PageObject,
     read_page_objects,
 )
+from .shapes import decode_outline, outline_width
 from .text_rtf import TextLine, TextRun, parse_rtf_runs
 
 # A4 in PDF points (72 dpi) — fallback for documents without an explicit page
@@ -106,14 +107,10 @@ _PENCIL_DEFAULT_WIDTH_PT = 4.0
 _PENCIL_PRESSURE_GAIN = 9.0
 _PENCIL_MIN_PRESSURE = 0.10
 
-# Vector shapes (line / oval / triangle / polygon) draw as crisp ~5 pt black
-# outlines in the reference.  Their widthless default is _PEN_DEFAULT_WIDTH_PT
-# (10.91 pt), which is ~2x too heavy: a fat black ring anti-aliases into a soft
-# gray band, so the ovals/triangle read as "gray / faint / too transparent"
-# instead of crisp black.  The tpl template's width (f9.f15 = 10.394 canvas
-# units) × scale = 5.67 pt, matching the measured reference ring (~5.2 pt).
-# Store in canvas units like every other stroke width.
-_SHAPE_DEFAULT_WIDTH_PT = 10.4
+# Shape outline width (canvas units) when f9.f15 is absent: the value every
+# shape in the samples carries.
+_SHAPE_DEFAULT_WIDTH = 10.3937
+
 
 # Marker strokes store a *uniform* width as a single float32 at byte 40 of the
 # decompressed geometry blob (after the "tpl\0"+length+style-template header).
@@ -131,11 +128,14 @@ class Stroke:
     ``points`` is a list of ``(x, y, width)`` triples in canvas space.
     ``kind`` is ``"pen"``, ``"highlighter"`` or ``"eraser"``.
     ``color`` is RGBA (0..1).  Eraser strokes are always white.
+    ``fill`` is the RGBA interior colour of a filled (closed) shape, else None;
+    writers paint it underneath the outline.
     """
 
     points: List[Tuple[float, float, float]]  # (x, y, width)
     color: Tuple[float, float, float, float] = (0.0, 0.0, 0.0, 1.0)
     kind: str = "pen"
+    fill: Optional[Tuple[float, float, float, float]] = None
 
     @property
     def is_dot(self) -> bool:
@@ -185,7 +185,7 @@ class TextBox:
 
 @dataclass
 class Page:
-    strokes: List[Stroke] = field(default_factory=list)
+    strokes: List[Stroke] = field(default_factory=list)  # in paint order
     images: List[Image] = field(default_factory=list)
     texts: List[TextBox] = field(default_factory=list)
     width: float = A4_WIDTH_PT
@@ -589,16 +589,11 @@ def extract_pencil(raw: bytes) -> List[Tuple[float, float, float]]:
 
 
 def _stroke_origin(content_fields) -> Optional[Tuple[float, float]]:
-    """Read the stroke's origin/anchor offset from field ``#6``.
+    """Read an object's translation from field ``#6`` (``{1: dx, 2: dy}``).
 
-    Some strokes (the grouped marker strokes, tagged with a layer UUID in
-    field ``#10``) store their points relative to a per-stroke origin instead
-    of the canvas.  Field ``#6`` is a small nested message holding that origin
-    as float32 sub-fields ``1 = x`` and ``2 = y``.  It is the translation that
-    maps the stored (relative) frame back to canvas space, so it is *added* to
-    every stored point.  Strokes without a ``#6`` message — including all
-    primary (stride-12) strokes and the small flag-run strokes — carry no
-    offset and decode in canvas coordinates directly.
+    Moving a stroke or shape in GoodNotes does not rewrite its geometry; it
+    stores the move as this translation, which is *added* to every stored
+    point (Test_11 "Moved" page).  Objects never moved carry an empty ``#6``.
     """
     blobs = content_fields.get(6)
     if not blobs:
@@ -615,16 +610,23 @@ def _stroke_origin(content_fields) -> Optional[Tuple[float, float]]:
     return None
 
 
-def _extract_color(content_fields) -> Tuple[float, float, float, float]:
-    """Read the RGBA colour from field ``#4`` (float32 sub-fields 1..4)."""
+def _rgba(msg) -> Optional[Tuple[float, float, float, float]]:
+    """Decode an RGBA message (float32 sub-fields ``1..4``).
+
+    An omitted R/G/B is 0.0; an omitted alpha is taken as opaque.
+    """
+    if not isinstance(msg, (bytes, bytearray)):
+        return None
     color = [0.0, 0.0, 0.0, 1.0]
-    blobs = content_fields.get(4)
-    if not blobs:
-        return tuple(color)
-    for sub_field, _wt, val in iter_fields(blobs[0]):
+    for sub_field, _wt, val in iter_fields_tolerant(bytes(msg)):
         if 1 <= sub_field <= 4 and isinstance(val, float):
             color[sub_field - 1] = val
-    return tuple(color)
+    return (color[0], color[1], color[2], color[3])
+
+
+def _extract_color(content_fields) -> Tuple[float, float, float, float]:
+    """Read a stroke's RGBA colour from field ``#4`` (default opaque black)."""
+    return _rgba(content_fields.get(4, [None])[0]) or (0.0, 0.0, 0.0, 1.0)
 
 
 def _find_geometry_blob(content_fields) -> Optional[bytes]:
@@ -632,119 +634,6 @@ def _find_geometry_blob(content_fields) -> Optional[bytes]:
         if isinstance(chunk, (bytes, bytearray)) and is_apple_lz4(chunk):
             return bytes(chunk)
     return None
-
-
-def _vector_shape_points(content_fields) -> List[Tuple[float, float]]:
-    """Read the control points of a GoodNotes *vector shape* from field ``#9``.
-
-    Shapes (line / triangle / polygon / small marks) store their defining
-    points as ``{1: x, 2: y}`` float32 messages inside field ``#9``.  The
-    container varies: either repeated points under ``f9.f1`` or a single
-    message whose points are numbered sub-fields (``f9.f2.f1/f2/f3``).  Both
-    layouts are covered by a recursive walk that collects every
-    ``{1: float, 2: float}`` leaf it finds.
-
-    ``f9.f4`` is deliberately ignored: it holds a transform / bounds anchor
-    (two floats plus a scalar) that spans the whole page, not ink — decoding
-    it would draw a giant diagonal.  Coordinates are canvas units, same space
-    as the freehand strokes.  Returns ``[]`` when the record carries no such
-    point container (fewer than two points, or a ``#9`` that is only the
-    ``f4`` anchor).
-    """
-    for blob in content_fields.get(9, []):
-        if not isinstance(blob, (bytes, bytearray)):
-            continue
-        top: List[Tuple[int, int, bytes]] = []
-        try:
-            top = [(f, wt, bytes(v)) for f, wt, v in iter_fields_tolerant(blob)
-                   if isinstance(v, (bytes, bytearray))]
-        except (ValueError, struct.error):
-            continue
-        pts: List[Tuple[float, float]] = []
-        for f, _wt, v in top:
-            if f not in (1, 2):  # f4 = transform anchor, not ink
-                continue
-            _collect_shape_points(v, pts)
-        if len(pts) >= 2:
-            return pts
-    return []
-
-
-def _collect_shape_points(blob: bytes, out: List[Tuple[float, float]]) -> None:
-    """Recursively collect ``{1: x, 2: y}`` point leaves from a shape frame."""
-    try:
-        fields = list(iter_fields(blob))
-    except (ValueError, struct.error):
-        return
-    # Is this blob itself a point message?
-    vals = {f: v for f, _wt, v in fields}
-    if (set(vals) == {1, 2} and isinstance(vals.get(1), float)
-            and isinstance(vals.get(2), float)):
-        out.append((vals[1], vals[2]))
-        return
-    for _f, _wt, v in fields:
-        if isinstance(v, (bytes, bytearray)):
-            _collect_shape_points(bytes(v), out)
-
-
-def _vector_oval_points(content_fields) -> List[Tuple[float, float]]:
-    """Sample a GoodNotes *oval/ellipse* vector shape from field ``#9``.
-
-    Oval shapes (type codes 30/31/36/39, etc.) don't store explicit vertices:
-    field ``f9.f4`` holds the ellipse as a **center point** (``f4.f1`` =
-    ``{1: x, 2: y}``), **two semi-axes** (``f4.f2`` = ``{1: rx, 2: ry}``) and
-    a **rotation angle in radians** (``f4.f3``).  This is the layout that
-    `_vector_shape_points` deliberately skips (it reads only ``f9.f1``/``f9.f2``),
-    so ovals came back missing.  We sample the ellipse into a closed polygon of
-    ``steps`` vertices (canvas units, same space as freehand strokes) so the PDF
-    emitter draws it like any polygon.  Returns ``[]`` when the record has no
-    such oval frame.  (``rx == ry`` yields a circle, e.g. the tiny dots.)
-    """
-    for blob in content_fields.get(9, []):
-        if not isinstance(blob, (bytes, bytearray)):
-            continue
-        f4 = None
-        try:
-            for f, _wt, v in iter_fields_tolerant(blob):
-                if f == 4 and isinstance(v, (bytes, bytearray)):
-                    f4 = bytes(v)
-                    break
-        except (ValueError, struct.error):
-            continue
-        if f4 is None:
-            continue
-        cx = cy = rx = ry = None
-        rot = 0.0
-        try:
-            sub = {f: v for f, _wt, v in iter_fields_tolerant(f4)}
-        except (ValueError, struct.error):
-            continue
-        c = sub.get(1)
-        a = sub.get(2)
-        if not (isinstance(c, (bytes, bytearray)) and isinstance(a, (bytes, bytearray))):
-            continue
-        try:
-            cp = {f: v for f, _wt, v in iter_fields(c)}
-            ax = {f: v for f, _wt, v in iter_fields(a)}
-        except (ValueError, struct.error):
-            continue
-        cx, cy = cp.get(1), cp.get(2)
-        rx, ry = ax.get(1), ax.get(2)
-        if None in (cx, cy, rx, ry):
-            continue
-        if not all(isinstance(v, float) for v in (cx, cy, rx, ry)):
-            continue
-        rot = sub.get(3, 0.0) if isinstance(sub.get(3), float) else 0.0
-        ca, sa = math.cos(rot), math.sin(rot)
-        steps = 64
-        pts: List[Tuple[float, float]] = []
-        for i in range(steps + 1):
-            t = 2.0 * math.pi * i / steps
-            lx = rx * math.cos(t)
-            ly = ry * math.sin(t)
-            pts.append((cx + lx * ca - ly * sa, cy + lx * sa + ly * ca))
-        return pts
-    return []
 
 
 # --------------------------------------------------------------------------- #
@@ -1010,33 +899,25 @@ def _is_pencil(color) -> bool:
     return abs(r - g) < 0.02 and abs(g - b) < 0.02 and a < 0.9
 
 
-def _shape_template_width(content_fields) -> Optional[float]:
-    """Read a vector shape's width from its ``f9.f15`` template float.
-
-    Every f9 shape record carries a single canvas-unit float in ``f9.f15`` (the
-    stroke template's width).  For the Test9 ovals/triangle that value is
-    10.394 canvas units → 10.394 × scale(6/11) = 5.67 pt, matching the measured
-    reference ring (~5.2 pt).  Returns ``None`` when the field is absent or not
-    a plausible width, so the caller falls back to ``_SHAPE_DEFAULT_WIDTH_PT``.
-    """
-    for blob in content_fields.get(9, []):
-        if not isinstance(blob, (bytes, bytearray)):
-            continue
-        try:
-            for f, _wt, v in iter_fields_tolerant(blob):
-                if f == 15 and isinstance(v, float) and 0.05 < v < 200.0:
-                    return v
-        except (ValueError, struct.error):
-            continue
-    return None
-
-
 def _parse_stroke(cf, scale: float = 1.0) -> Optional[Stroke]:
     """Build a Stroke from a field ``#7`` content message."""
     blob = _find_geometry_blob(cf)
     raw = apple_decompress(blob) if blob is not None else None
     color = _extract_color(cf)
     tool_id = cf.get(21, [None])[0]
+
+    # Shape-recognised strokes keep their exact geometry in f9 (the f2 blob is
+    # only the style template).  An empty f9 means a freehand stroke.
+    f9 = cf.get(9, [b""])[0]
+    if isinstance(f9, (bytes, bytearray)) and f9:
+        outline = decode_outline(bytes(f9))
+        if outline:
+            w = outline_width(bytes(f9)) or _SHAPE_DEFAULT_WIDTH
+            # A moved shape keeps its original geometry plus a translation in
+            # f6, exactly like a moved freehand stroke.
+            dx, dy = _stroke_origin(cf) or (0.0, 0.0)
+            return Stroke(points=[(x + dx, y + dy, w) for x, y in outline.points],
+                          color=color, kind="pen")
 
     if tool_id == 25 and raw is not None:
         # Pencil: dense pressure-sensitive stride-12 (x, y, pressure) records.
@@ -1091,26 +972,7 @@ def _parse_stroke(cf, scale: float = 1.0) -> Optional[Stroke]:
             fp_color = (0.30, 0.30, 0.30, 1.0)
             return Stroke(points=[(x, y, w_canvas) for x, y in f4_pts],
                           color=fp_color, kind="pen")
-    # Vector shapes (line / rect / ellipse / triangle / polygon) keep their
-    # defining control points in field #9, and their field-#2 LZ4 blob is only
-    # the "tpl" style template (decodes to no points) — so extract_points()
-    # yields nothing.  Handle them before the empty-points bail-out: 2 points
-    # = open line, 3 = triangle, 4+ = closed polygon.
     if not pts:
-        shape_pts = _vector_shape_points(cf)
-        if not shape_pts:
-            shape_pts = _vector_oval_points(cf)
-        if shape_pts:
-            # f4 for a vector shape is a width *float* (or absent), not an
-            # RGBA blob, so the ink is the default pen colour (black).  The
-            # shape's real width is the canvas-unit float in f9.f15 (the tpl
-            # template), matching the reference ring; fall back to the measured
-            # default when absent.  Storing canvas units lets the emitter ×scale.
-            w_canvas = _shape_template_width(cf)
-            if w_canvas is None:
-                w_canvas = _SHAPE_DEFAULT_WIDTH_PT
-            return Stroke(points=[(x, y, w_canvas) for x, y in shape_pts],
-                          color=(0.0, 0.0, 0.0, 1.0), kind="pen")
         return None
     # If the buffer carries a marker width float (offset 40) use it — GoodNotes
     # markers have a single uniform width; otherwise fall back to the default pen width.
@@ -1152,11 +1014,16 @@ def parse_page(data: bytes, attachments: Dict[str, bytes],
     if canvas and page_size:
         page.scale = page_size[0] / canvas[0]
 
+    by_id: Dict[str, Stroke] = {}
+    fills: List[PageObject] = []
     for obj in read_page_objects(data):
         if obj.kind == KIND_STROKE:
             stroke = _parse_stroke(obj.fields, scale=page.scale)
             if stroke:
                 page.strokes.append(stroke)
+                by_id[obj.id] = stroke
+        elif obj.kind == KIND_FILL:
+            fills.append(obj)
         elif obj.kind == KIND_IMAGE:
             img = _parse_image(obj, attachments)
             if img:
@@ -1169,7 +1036,30 @@ def parse_page(data: bytes, attachments: Dict[str, bytes],
             box = _parse_text_object(obj.body)
             if box:
                 page.texts.append(box)
+    for obj in fills:
+        _apply_fill(obj, by_id)
+    # The file lists strokes topmost-first; expose them in paint order
+    # (bottom-most first) so every writer can simply draw them in sequence.
+    page.strokes.reverse()
     return page
+
+
+def _apply_fill(obj: PageObject, strokes: Dict[str, "Stroke"]) -> None:
+    """Attach a fill object's colour to the shape outline it fills.
+
+    A fill (body kind 9) references its outline stroke by UUID in ``f5`` and
+    stores the fill RGBA in ``f7``; its ``f4`` repeats the outline geometry, so
+    the outline's points already describe the filled area.
+    """
+    target = obj.fields.get(5, [None])[0]
+    if not isinstance(target, (bytes, bytearray)):
+        return
+    stroke = strokes.get(bytes(target).decode("ascii", "ignore").strip())
+    if stroke is None:
+        return
+    rgba = _rgba(obj.fields.get(7, [None])[0])
+    if rgba is not None:
+        stroke.fill = rgba
 
 
 def _parse_image(obj: PageObject, attachments: Dict[str, bytes]) -> Optional[Image]:

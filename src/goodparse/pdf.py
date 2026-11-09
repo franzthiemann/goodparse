@@ -452,17 +452,26 @@ def _page_content(page, width_scale: float, alpha_name: Dict[float, str],
             out.append(f"q {_num(pw, 2)} 0 0 {_num(ph, 2)} "
                        f"{_num(px, 2)} {_num(ypdf, 2)} cm /{name} Do Q")
 
-    # --- strokes ------------------------------------------------------------ #
-    # GoodNotes stores each page's strokes in *reverse* paint order (the
-    # topmost, last-drawn stroke comes first in the file), so render them in
-    # reverse to restore the intended layering (e.g. the basketball's black
-    # seams sit on top of the orange fill).
-    for stroke in reversed(page.strokes):
+    # --- strokes (already in paint order) ----------------------------------- #
+    for stroke in page.strokes:
         r, g, b, a = stroke.color
         pts = _stroke_points(stroke)
         widths = [max(_MIN_WIDTH, w * width_scale * s) for _x, _y, w in pts]
         if len(pts) < 2:
             continue
+        if stroke.fill is not None:
+            # Shape interior, painted beneath its outline in its own q/Q so
+            # the fill alpha cannot leak into the outline.
+            fr, fg, fb, fa = stroke.fill
+            out.append("q")
+            out.append(f"{_num(fr)} {_num(fg)} {_num(fb)} rg")
+            if fa < 1.0:
+                out.append(f"/{alpha_name[round(fa, 4)]} gs")
+            out.append(f"{_num(pts[0][0] * s, 2)} {_num(h - pts[0][1] * s, 2)} m")
+            for x, y, _w in pts[1:]:
+                out.append(f"{_num(x * s, 2)} {_num(h - y * s, 2)} l")
+            out.append("h f")
+            out.append("Q")
         # Emission order matters: caps (J/j) must be separated from ``RG`` by
         # a ``w``.  pypdfium2/Skia renders the stroke black when a cap/join
         # operator appears immediately before the colour, so go
@@ -489,7 +498,7 @@ def _page_content(page, width_scale: float, alpha_name: Dict[float, str],
         out.append(f"{_num(widths[0])} w")
         out.append(f"{_num(r)} {_num(g)} {_num(b)} RG")
         if a < 1.0:
-            out.append(f"/{alpha_name[a]} gs")
+            out.append(f"/{alpha_name[round(a, 4)]} gs")
         if uniform:
             out.append(f"{_num(pts[0][0] * s, 2)} {_num(h - pts[0][1] * s, 2)} m")
             for k in range(1, len(pts)):
@@ -521,8 +530,9 @@ def build_pdf(doc: GoodNotesDocument, width_scale: float = 1.0) -> bytes:
 
     # Unique non-opaque alphas across the whole doc -> shared ExtGState objects.
     alphas = sorted({
-        round(s.color[3], 4)
-        for page in pages for s in page.strokes if s.color[3] < 1.0
+        round(c[3], 4)
+        for page in pages for s in page.strokes
+        for c in (s.color, s.fill) if c is not None and c[3] < 1.0
     })
     alpha_name = {a: f"GS{i}" for i, a in enumerate(alphas)}
     has_font = any(page.texts for page in pages)
