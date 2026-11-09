@@ -8,7 +8,8 @@ after that uniform scale.
 Strokes are drawn as vector paths.  A pressure-varying stroke can't be a single
 polyline (PDF line width is constant per path), so each segment is emitted on
 its own with round caps; segment *k* uses the mean of its endpoint widths, and
-the overlapping round caps blend into one smooth, tapering stroke.  Colour alpha
+the overlapping round caps blend into one smooth, tapering stroke (inside a
+transparency group when translucent, so overlaps don't darken).  Colour alpha
 maps to a shared ``/ExtGState`` (``/ca`` / ``/CA``).
 
 Full-fidelity media (page *backgrounds* and *embedded photos*) are embedded as
@@ -23,12 +24,14 @@ Flate content streams, a single linear ``xref`` table and a ``trailer``).
 
 from __future__ import annotations
 
-import re
 import zlib
-from types import SimpleNamespace
 from typing import Dict, List, Optional, Tuple
 
-from .goodnotes import GoodNotesDocument, Stroke, TextBox
+from .model import GoodNotesDocument, Stroke, TextBox
+from .base14_widths import base14_font, base14_key, run_width
+from .text_rtf import TextRun
+from .raster import is_rotated
+from .textlayout import layout_text
 
 # Optional, heavier dependencies for raster media + text.  Kept optional so the
 # core library imports with zero third-party packages (the stroke-only path is
@@ -82,59 +85,6 @@ def _pdf_escape(s: str) -> str:
     """Escape a string for a PDF ``(...)`` literal."""
     return s.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
 
-
-def _text_font_size(t: TextBox) -> float:
-    """Canvas-space point size of a text box.
-
-    Field-21 sticker text stores an explicit canvas-unit size (``font_size``
-    — still scaled by ``s`` at emit time); RTF boxes fall back to guessing from
-    ``\\fs``.
-    """
-    if t.font_size > 0:
-        return t.font_size
-    m = re.search(r"\\fs(\d+)", t.rtf)
-    if m:
-        return int(m.group(1)) / 2.0
-    nlines = max(1, len(t.plain.split("\n")))
-    return max(8.0, t.size[1] / (1.2 * nlines))
-
-
-# Helvetica glyph advance widths (Adobe WinAnsi), in thousandths of an em.  Used
-# only to place underlines/strikethroughs under styled runs; a 0 entry means
-# "use the space width".
-_HELVETICA_ADV = {
-    0x20: 278, 0x21: 278, 0x22: 355, 0x23: 556, 0x24: 556, 0x25: 889,
-    0x26: 667, 0x27: 191, 0x28: 333, 0x29: 333, 0x2a: 389, 0x2b: 584,
-    0x2c: 278, 0x2d: 333, 0x2e: 278, 0x2f: 278, 0x30: 556, 0x31: 556,
-    0x32: 556, 0x33: 556, 0x34: 556, 0x35: 556, 0x36: 556, 0x37: 556,
-    0x38: 556, 0x39: 556, 0x3a: 278, 0x3b: 278, 0x3c: 584, 0x3d: 584,
-    0x3e: 584, 0x3f: 389, 0x40: 1015, 0x5b: 278, 0x5c: 278, 0x5d: 278,
-    0x5e: 469, 0x5f: 556, 0x60: 333, 0x7b: 278, 0x7c: 260, 0x7d: 278,
-    0x7e: 584,
-}
-for _c in range(0x41, 0x5B):  # A-Z
-    _HELVETICA_ADV[_c] = 667
-for _c in range(0x61, 0x7B):  # a-z
-    _HELVETICA_ADV[_c] = 556
-# a few real exceptions in the base-1000 Helvetica metrics
-for _c, _w in [(0x44, 722), (0x57, 944), (0x46, 611), (0x54, 611),
-               (0x56, 667), (0x59, 667), (0x67, 556), (0x6c, 278),
-               (0x69, 278), (0x6a, 278), (0x66, 333), (0x75, 556),
-               (0x2e, 278), (0x2c, 278)]:
-    _HELVETICA_ADV[_c] = _w
-
-
-def _run_width(text: str, fs: float) -> float:
-    """Approximate advance width of ``text`` in PDF points at font size ``fs``."""
-    total = 0.0
-    for ch in text:
-        total += _HELVETICA_ADV.get(ord(ch), 556)
-    return total / 1000.0 * fs
-
-
-def _font_name(bold: bool, italic: bool,
-               font_map: Dict[Tuple[bool, bool], str]) -> str:
-    return "/" + font_map.get((bold, italic), "F1")
 
 
 def _pdf_form_xobject(data: bytes) -> Optional[Tuple[float, float, bytes]]:
@@ -223,26 +173,25 @@ def _raster_to_jpeg(data: bytes, place_w: float = 0.0,
             rgb = im.convert("RGB")
     except Exception:
         return None
-    if place_w > 0 and place_h > 0:
-        native_ar = rgb.width / rgb.height
-        placed_ar = place_w / place_h
-        # |native - placed| large AND native*placed ~ 1 -> the axes are swapped,
-        # i.e. a 90-degree rotation.  0.15 catches 4:3/3:4, 16:9/9:16, etc.
-        if abs(native_ar - placed_ar) > 0.15 and abs(native_ar * placed_ar - 1.0) < 0.5:
-            rgb = rgb.rotate(270, expand=True)  # CCW 90 degrees
+    if is_rotated(rgb.width, rgb.height, place_w, place_h):
+        rgb = rgb.rotate(270, expand=True)  # CCW 90 degrees
     buf = io.BytesIO()
     rgb.save(buf, format="JPEG", quality=_JPEG_QUALITY)
     return rgb.width, rgb.height, buf.getvalue()
 
 
-def _background_to_jpeg(bg: bytes) -> Optional[Tuple[int, int, bytes]]:
-    """Render a background paper PDF's first page to an RGB JPEG XObject."""
+def _background_to_jpeg(bg: bytes, index: int = 0) -> Optional[Tuple[int, int, bytes]]:
+    """Render page ``index`` of a background paper PDF to an RGB JPEG."""
     if not _has_raster() or not bg:
         return None
     try:
         doc = _pdfium.PdfDocument(bg)
         try:
-            im = doc[0].render(scale=_BG_SCALE).to_pil().convert("RGB")
+            page = doc[index if index < len(doc) else 0]
+            bitmap = page.render(scale=_BG_SCALE)
+            im = bitmap.to_pil().convert("RGB")
+            bitmap.close()
+            page.close()
         finally:
             doc.close()
     except Exception:
@@ -251,6 +200,14 @@ def _background_to_jpeg(bg: bytes) -> Optional[Tuple[int, int, bytes]]:
     buf = io.BytesIO()
     im.save(buf, format="JPEG", quality=_JPEG_QUALITY)
     return im.width, im.height, buf.getvalue()
+
+
+def _group_xobject(content: str, width: float, height: float) -> bytes:
+    """A page-sized transparency-group Form XObject painting ``content``."""
+    data = zlib.compress(content.encode("cp1252", "replace"))
+    return (f"<< /Type /XObject /Subtype /Form /BBox [0 0 {_num(width, 2)} "
+            f"{_num(height, 2)}] /Group << /S /Transparency >> /Length {len(data)} "
+            "/Filter /FlateDecode >>\nstream\n").encode() + data + b"\nendstream"
 
 
 def _image_obj(w: int, h: int, jpg: bytes) -> bytes:
@@ -262,127 +219,57 @@ def _image_obj(w: int, h: int, jpg: bytes) -> bytes:
 
 
 def _emit_text(parts: List[str], t: TextBox, s: float, h: float,
-               font_map: Dict[Tuple[bool, bool], str],
+               font_map: Dict[Tuple[str, bool, bool], str],
                embed_map: Optional[Dict] = None) -> None:
-    """Append ``Tj``/line ops for a text box (top-left origin -> PDF).
+    """Append text ops for a text box (top-left origin -> PDF).
 
-    Each styled run is emitted with its own font (``/F1``.. = plain,
-    bold, italic, bold-italic); underlines and strikethroughs are thin vector
-    lines positioned under/through the run using the Helvetica advance widths.
-    Runs are reflowed word-by-word so they wrap to the box width (matching the
-    reference, which wraps a long line) instead of overflowing the page.
-
-    When a run names a font family whose clone is installed (and fontTools is
-    available), it is emitted with an embedded subset font using 2-byte
-    glyph-ID codes (``<hex>``) and the font's real advance widths, so the
-    glyphs match the original.  Runs whose family isn't installed keep the
-    base-14 Helvetica path.
+    Placement comes from :func:`goodparse.textlayout.layout_text`.  A run is
+    drawn with its own size, colour and font: an embedded subset of the named
+    family when its clone is installed (2-byte glyph-ID ``<hex>`` strings,
+    real advance widths), else the closest base-14 family (Helvetica / Times
+    / Courier).  Underlines and strikethroughs are thin vector lines
+    under/through the run.
     """
-    # Field-21 sticker text stores its size in *canvas* units (like every other
-    # box) so it flows through the same canvas→page scale ``s``; the size is
-    # explicit so ``_text_font_size`` returns it directly.  It is a single
-    # unbreakable line (no real box width) so it must never wrap.
-    fs = _text_font_size(t) * s
-    x0 = t.position[0] * s
-    top = t.position[1] * s
-    box_w = float("inf") if t.font_size > 0 else max(fs * 0.5, t.size[0] * s)
-    leading = fs * 1.2
-
-    lines = t.lines if t.lines else [SimpleNamespace(
-        runs=[SimpleNamespace(text=t.plain, bold=False, italic=False,
-                              underline=False, strike=False, color=t.color)])]
-
-    # Flatten every run into (word, run-attrs) tokens, keeping each word's
-    # trailing space so styled runs join with the exact spacing of the original
-    # (GoodNotes packs words tight: "Test123italic" with no added spaces).
-    tokens = []
-    for line in lines:
-        for run in line.runs:
-            if not run.text:
-                continue
-            fam = getattr(run, "font_family", None)
-            for w in run.text.split(" "):
-                if not w:
-                    continue
-                tokens.append(SimpleNamespace(
-                    text=w, bold=run.bold, italic=run.italic,
-                    underline=run.underline, strike=run.strike,
-                    color=run.color, font_family=fam))
-
-    def _tok_embed(tok):
-        """Embedded font (``(res, ef)``) for a token, or ``None`` if base-14."""
-        if embed_map and tok.font_family:
-            ent = embed_map.get((tok.font_family, bool(tok.bold),
-                                 bool(tok.italic)))
+    def embedded(run):
+        if embed_map and run.font_family:
+            ent = embed_map.get((run.font_family, bool(run.bold), bool(run.italic)))
             if ent:
                 return ent[0], ent[1]
         return None
 
-    def _tok_width(tok, seg: str) -> float:
-        e = _tok_embed(tok)
+    def width(seg: str, run, size: float) -> float:
+        e = embedded(run)
         if e:
-            return e[1].width(seg) / 1000.0 * fs
-        return _run_width(seg, fs)
+            return e[1].width(seg) / 1000.0 * size
+        return run_width(seg, size, base14_key(run))
 
-    # Greedy word wrap across visual lines.
-    vlines: List[List] = [[]]
-    used = 0.0
-    for tok in tokens:
-        w = _tok_width(tok, tok.text)
-        space = _tok_width(tok, " ")
-        add = w + (space if vlines[-1] else 0.0)
-        if vlines[-1] and used + add > box_w and used > 0:
-            vlines.append([tok])
-            used = w
-        else:
-            vlines[-1].append(tok)
-            used += add
-
-    for j, vline in enumerate(vlines):
-        if not vline:
-            continue
-        baseline = h - (top + fs * 0.8 + j * leading)
-        cursor = x0
-        for k, tok in enumerate(vline):
-            r, g, b, _a = tok.color
-            seg = tok.text
-            if k < len(vline) - 1:
-                seg += " "
+    for line in layout_text(t, s, width):
+        baseline = h - line.baseline
+        for sg in line.segments:
+            seg, run, fs, cursor = sg.text, sg.run, sg.size, sg.x
+            r, g, b, _a = run.color
             parts.append(f"{_num(r)} {_num(g)} {_num(b)} rg")
-            emb = _tok_embed(tok)
+            emb = embedded(run)
             if emb is not None:
-                # Embedded subset font: 2-byte glyph-ID codes in a <hex>
-                # string; advance comes from the font's real widths.
                 fname, ef = emb
-                hexcodes = ef.code(seg).hex()
-                parts.append(f"{fname} {fs:.2f} Tf")
-                parts.append(
-                    f"BT {cursor:.2f} {baseline:.2f} Td <{hexcodes}> Tj ET")
-                w = ef.width(seg) / 1000.0 * fs
+                parts.append(f"/{fname} {fs:.2f} Tf")
+                parts.append(f"BT {cursor:.2f} {baseline:.2f} Td <{ef.code(seg).hex()}> Tj ET")
             else:
-                fname = _font_name(bool(tok.bold), bool(tok.italic), font_map)
-                parts.append(f"{fname} {fs:.2f} Tf")
-                parts.append(
-                    f"BT {cursor:.2f} {baseline:.2f} Td ({_pdf_escape(seg)}) Tj ET")
-                w = _run_width(seg, fs)
-            if tok.underline:
-                uy = baseline - fs * 0.12
-                parts.append(f"{_num(r)} {_num(g)} {_num(b)} RG")
-                parts.append(f"{max(0.5, fs * 0.05):.2f} w "
-                             f"{cursor:.2f} {uy:.2f} m "
-                             f"{cursor + w:.2f} {uy:.2f} l S")
-            if tok.strike:
-                sy = baseline + fs * 0.33
-                parts.append(f"{_num(r)} {_num(g)} {_num(b)} RG")
-                parts.append(f"{max(0.5, fs * 0.05):.2f} w "
-                             f"{cursor:.2f} {sy:.2f} m "
-                             f"{cursor + w:.2f} {sy:.2f} l S")
-            cursor += w
+                fname = font_map[base14_key(run)]
+                parts.append(f"/{fname} {fs:.2f} Tf")
+                parts.append(f"BT {cursor:.2f} {baseline:.2f} Td ({_pdf_escape(seg)}) Tj ET")
+            for flag, dy in ((run.underline, -0.12), (run.strike, 0.33)):
+                if flag:
+                    ly = baseline + fs * dy
+                    parts.append(f"{_num(r)} {_num(g)} {_num(b)} RG")
+                    parts.append(f"{max(0.5, fs * 0.05):.2f} w "
+                                 f"{cursor:.2f} {ly:.2f} m "
+                                 f"{cursor + width(seg.rstrip(), run, fs):.2f} {ly:.2f} l S")
 
 
 def _page_content(page, width_scale: float, alpha_name: Dict[float, str],
                   has_font: bool, next_num: int,
-                  font_map: Dict[Tuple[bool, bool], str],
+                  font_map: Dict[Tuple[str, bool, bool], str],
                   embed_map: Optional[Dict] = None
                   ) -> Tuple[str, List[str], Dict[int, bytes]]:
     """Build a page's content stream plus its image XObject objects.
@@ -394,10 +281,6 @@ def _page_content(page, width_scale: float, alpha_name: Dict[float, str],
     """
     s = page.scale
     h = page.height
-    # NOTE: the round cap/join (J/j) is emitted *per stroke*, just before that
-    # stroke's width, not here.  pypdfium2/Skia drops the stroke colour to
-    # black when a J or j operator appears *immediately before* an ``RG``;
-    # keeping a ``w`` between them avoids that (see the per-stroke emission).
     out: List[str] = []
     xrefs: List[str] = []
     img_bodies: Dict[int, bytes] = {}
@@ -410,7 +293,7 @@ def _page_content(page, width_scale: float, alpha_name: Dict[float, str],
 
     # --- background (drawn first, so everything sits on top) ---------------- #
     if _has_raster() and page.background:
-        bg = _background_to_jpeg(page.background)
+        bg = _background_to_jpeg(page.background, page.background_page)
         if bg:
             w, hh, jpg = bg
             num = take_num()
@@ -452,59 +335,73 @@ def _page_content(page, width_scale: float, alpha_name: Dict[float, str],
             out.append(f"q {_num(pw, 2)} 0 0 {_num(ph, 2)} "
                        f"{_num(px, 2)} {_num(ypdf, 2)} cm /{name} Do Q")
 
-    # --- strokes ------------------------------------------------------------ #
-    # GoodNotes stores each page's strokes in *reverse* paint order (the
-    # topmost, last-drawn stroke comes first in the file), so render them in
-    # reverse to restore the intended layering (e.g. the basketball's black
-    # seams sit on top of the orange fill).
-    for stroke in reversed(page.strokes):
+    # --- text-box backgrounds (beneath the ink) ----------------------------- #
+    for t in page.texts:
+        if t.background is not None:
+            r, g, b, a = t.background
+            x, y = t.position[0] * s, h - (t.position[1] + t.size[1]) * s
+            out.append("q")
+            if a < 1.0:
+                out.append(f"/{alpha_name[round(a, 4)]} gs")
+            out.append(f"{_num(r)} {_num(g)} {_num(b)} rg "
+                       f"{_num(x, 2)} {_num(y, 2)} {_num(t.size[0] * s, 2)} "
+                       f"{_num(t.size[1] * s, 2)} re f Q")
+    # --- strokes (already in paint order) ----------------------------------- #
+    for stroke in page.strokes:
         r, g, b, a = stroke.color
         pts = _stroke_points(stroke)
         widths = [max(_MIN_WIDTH, w * width_scale * s) for _x, _y, w in pts]
         if len(pts) < 2:
             continue
-        # Emission order matters: caps (J/j) must be separated from ``RG`` by
-        # a ``w``.  pypdfium2/Skia renders the stroke black when a cap/join
-        # operator appears immediately before the colour, so go
-        # caps -> width -> colour -> path.
-        #
-        # Each stroke is wrapped in a graphics-state save/restore (q … Q) so
-        # the alpha ExtGState set for a translucent stroke (pencil / tape /
-        # highlighter at alpha < 1) cannot *leak* to the next stroke.  Without
-        # it, every subsequent opaque stroke inherits the 0.5 alpha and renders
-        # as a faint gray band over the grid (the "gray ovals / too-transparent
-        # triangle" bug).  q/Q also isolates the per-stroke width/caps.
-        out.append("q")
-        out.append("J 1")
-        out.append("j 1")
-        # A uniform-width stroke is one continuous path: 131 overlapping
-        # per-segment round caps would blend to a muddy grey under alpha (and
-        # produce the "highlighter rectangles" artifact).  Only a pressure
-        # (width-varying) stroke needs per-segment paths, and even then only
-        # where the width actually changes.
-        uniform = max(widths) - min(widths) < 1e-6
-        # Always emit a width before ``RG`` so the caps above are separated
-        # from the colour; for a pressure stroke this is just a lead-in
-        # (each segment below sets its own width).
-        out.append(f"{_num(widths[0])} w")
-        out.append(f"{_num(r)} {_num(g)} {_num(b)} RG")
-        if a < 1.0:
-            out.append(f"/{alpha_name[a]} gs")
-        if uniform:
+        if stroke.fill is not None:
+            # Shape interior, painted beneath its outline in its own q/Q so
+            # the fill alpha cannot leak into the outline.
+            fr, fg, fb, fa = stroke.fill
+            out.append("q")
+            out.append(f"{_num(fr)} {_num(fg)} {_num(fb)} rg")
+            if fa < 1.0:
+                out.append(f"/{alpha_name[round(fa, 4)]} gs")
             out.append(f"{_num(pts[0][0] * s, 2)} {_num(h - pts[0][1] * s, 2)} m")
+            for x, y, _w in pts[1:]:
+                out.append(f"{_num(x * s, 2)} {_num(h - y * s, 2)} l")
+            out.append("h f")
+            out.append("Q")
+        # Each stroke is wrapped in q … Q so its alpha ExtGState, width and
+        # caps cannot leak into the next stroke.  Round caps and joins (PDF
+        # operators are postfix: ``1 J 1 j``) give GoodNotes' rounded ends and
+        # let the per-segment pieces of a pressure stroke blend seamlessly.
+        # A uniform-width stroke is one continuous path.  A width-varying
+        # (pressure) stroke is drawn segment by segment; under alpha the
+        # overlapping round caps would double up, so a translucent one is
+        # painted opaque inside a transparency-group Form XObject and the
+        # alpha applied once, to the whole group.
+        uniform = max(widths) - min(widths) < 1e-6
+        path = ["q 1 J 1 j", f"{_num(widths[0])} w", f"{_num(r)} {_num(g)} {_num(b)} RG"]
+        if uniform:
+            path.append(f"{_num(pts[0][0] * s, 2)} {_num(h - pts[0][1] * s, 2)} m")
             for k in range(1, len(pts)):
-                out.append(f"{_num(pts[k][0] * s, 2)} {_num(h - pts[k][1] * s, 2)} l")
-            out.append("S")
+                path.append(f"{_num(pts[k][0] * s, 2)} {_num(h - pts[k][1] * s, 2)} l")
+            path.append("S")
         else:
             for k in range(len(pts) - 1):
                 w = (widths[k] + widths[k + 1]) / 2.0
                 x0, y0, _w0 = pts[k]
                 x1, y1, _w1 = pts[k + 1]
-                out.append(f"{_num(w)} w")
-                out.append(f"{_num(x0 * s, 2)} {_num(h - y0 * s, 2)} m")
-                out.append(f"{_num(x1 * s, 2)} {_num(h - y1 * s, 2)} l")
-                out.append("S")
-        out.append("Q")
+                path.append(f"{_num(w)} w")
+                path.append(f"{_num(x0 * s, 2)} {_num(h - y0 * s, 2)} m")
+                path.append(f"{_num(x1 * s, 2)} {_num(h - y1 * s, 2)} l")
+                path.append("S")
+        path.append("Q")
+        if a >= 1.0:
+            out.extend(path)
+        elif uniform:
+            out.extend(path[:3] + [f"/{alpha_name[round(a, 4)]} gs"] + path[3:])
+        else:
+            num = take_num()
+            name = f"Gr{num}"
+            img_bodies[num] = _group_xobject("\n".join(path), page.width, h)
+            xrefs.append(f"/{name} {num} 0 R")
+            out.append(f"q /{alpha_name[round(a, 4)]} gs /{name} Do Q")
 
     # --- text --------------------------------------------------------------- #
     if has_font:
@@ -521,8 +418,13 @@ def build_pdf(doc: GoodNotesDocument, width_scale: float = 1.0) -> bytes:
 
     # Unique non-opaque alphas across the whole doc -> shared ExtGState objects.
     alphas = sorted({
-        round(s.color[3], 4)
-        for page in pages for s in page.strokes if s.color[3] < 1.0
+        round(c[3], 4)
+        for page in pages for s in page.strokes
+        for c in (s.color, s.fill) if c is not None and c[3] < 1.0
+    } | {
+        round(t.background[3], 4)
+        for page in pages for t in page.texts
+        if t.background is not None and t.background[3] < 1.0
     })
     alpha_name = {a: f"GS{i}" for i, a in enumerate(alphas)}
     has_font = any(page.texts for page in pages)
@@ -539,7 +441,7 @@ def build_pdf(doc: GoodNotesDocument, width_scale: float = 1.0) -> bytes:
     # Number the remaining objects without gaps: fonts (if text) then images.
     # /F1..Fn = Helvetica plain / bold / italic / bold-italic; only the
     # variants actually referenced by a styled run get an object.
-    font_map: Dict[Tuple[bool, bool], str] = {}
+    font_map: Dict[Tuple[str, bool, bool], str] = {}
     next_free = ext_first + len(alphas)
     font_obj = next_free
     if has_font:
@@ -548,12 +450,11 @@ def build_pdf(doc: GoodNotesDocument, width_scale: float = 1.0) -> bytes:
             for t in page.texts:
                 runs = [r for ln in (t.lines or []) for r in ln.runs]
                 if not runs:
-                    runs = [SimpleNamespace(bold=False, italic=False, text="")]
+                    runs = [TextRun(text="")]
                 for r in runs:
-                    used.add((bool(r.bold), bool(r.italic)))
-        for fi, (bold, italic) in enumerate(
-                sorted(used, key=lambda b: (b[0], b[1]))):
-            font_map[(bold, italic)] = f"F{fi + 1}"
+                    used.add(base14_key(r))
+        for fi, key in enumerate(sorted(used)):
+            font_map[key] = f"F{fi + 1}"
         next_free += len(font_map)
     # Optional embedded fonts: for any run that names a non-base-14 family
     # (e.g. "Futura") whose clone is installed, subset it and embed it so the
@@ -580,7 +481,11 @@ def build_pdf(doc: GoodNotesDocument, width_scale: float = 1.0) -> bytes:
             path = _font_embed.find_font_file(fam, bold, italic)
             if not path:
                 continue
-            ef = _font_embed.subset_and_embed(path, text, "GP")
+            # Subset fonts need distinct names: "ABCDEF+Family[Bold][Italic]".
+            n = len(embed_map)
+            tag = "GP" + "".join(chr(65 + (n // 26 ** k) % 26) for k in range(4))
+            style = ("Bold" if bold else "") + ("Italic" if italic else "")
+            ef = _font_embed.subset_and_embed(path, text, f"{tag}+{fam}{style}")
             if ef is None:
                 continue
             res = "EF%d" % (len(embed_map) + 1)
@@ -598,14 +503,10 @@ def build_pdf(doc: GoodNotesDocument, width_scale: float = 1.0) -> bytes:
     for j, a in enumerate(alphas):
         bodies[extg_obj(j)] = f"<< /ca {_num(a)} /CA {_num(a)} >>".encode()
     if has_font:
-        _base = {(False, False): "/Helvetica", (True, False): "/Helvetica-Bold",
-                 (False, True): "/Helvetica-Oblique",
-                 (True, True): "/Helvetica-BoldOblique"}
-        for fi, ((bold, italic), fname) in enumerate(font_map.items()):
+        for fi, key in enumerate(font_map):
             bodies[font_obj + fi] = (
-                b"<< /Type /Font /Subtype /Type1 /BaseFont "
-                + _base[(bold, italic)].encode()
-                + b" /Encoding /WinAnsiEncoding >>")
+                f"<< /Type /Font /Subtype /Type1 /BaseFont /{base14_font(key)}"
+                " /Encoding /WinAnsiEncoding >>").encode()
 
     for num, payload in embed_objs.items():
         bodies[num] = payload
@@ -630,7 +531,7 @@ def build_pdf(doc: GoodNotesDocument, width_scale: float = 1.0) -> bytes:
         if has_font:
             font_refs = " ".join(
                 f"/{fname} {font_obj + fi} 0 R"
-                for fi, ((bold, italic), fname) in enumerate(font_map.items()))
+                for fi, fname in enumerate(font_map.values()))
             if embed_map:
                 font_refs += " " + " ".join(
                     f"/{res} {base_obj} 0 R"

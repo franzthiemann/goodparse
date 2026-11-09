@@ -31,50 +31,65 @@ class TextRun:
     # Used only by the optional embedded-font path; the base-14 emitter
     # ignores it.
     font_family: Optional[str] = None
+    # Explicit size in canvas units (text objects carry one per run); None =
+    # the box's size.
+    size: Optional[float] = None
 
 
 @dataclass
 class TextLine:
     """One visual line of a text box: an ordered list of styled runs."""
     runs: List[TextRun] = field(default_factory=list)
+    align: str = "left"  # "left" | "center" | "right" | "justify"
 
     def text(self) -> str:
         return "".join(r.text for r in self.runs)
 
 
+# RTF tokens.  Raw CR/LF in the source are not text (RTF ignores them); a
+# backslash followed by a line break is a paragraph break, like ``\par``.
 _TOKEN = re.compile(
     r"\\(?P<word>[a-zA-Z]+)(?P<num>-?\d*) ?|\\'(?P<hex>[0-9a-fA-F]{2})|"
-    r"(?P<char>[^\{}\\\n])|(?P<nl>\n)|(?P<open>{)|(?P<close>})"
+    r"(?P<parbreak>\\\r?\n)|\\(?P<sym>[^a-zA-Z0-9'])|"
+    r"(?P<char>[^\{}\\\r\n])|(?P<nl>\r?\n)|(?P<open>{)|(?P<close>})"
 )
 
 
+# Destination groups whose content is not body text.  Any ``{\\* ...}`` group
+# is ignorable by definition; ``\\listtext`` holds a pre-rendered list marker
+# that Cocoa repeats in the paragraph text itself.
+_DESTINATIONS = ("fonttbl", "colortbl", "stylesheet", "listtable",
+                 "listoverridetable", "listtext", "info", "pict")
+_GROUP_START = re.compile(r"\{\\(\*|[a-zA-Z]+)")
+
+
 def _strip_table_groups(s: str) -> str:
-    """Remove ``{\\fonttbl ...}``, ``{\\colortbl ...}``, ``{\\*\\expandedcolortbl ...}``,
-    ``{\\stylesheet ...}`` groups (the opening brace precedes the marker)."""
-    for tbl in ("fonttbl", "colortbl", "expandedcolortbl", "stylesheet"):
-        marker = "\\" + tbl
-        while True:
-            i = s.find(marker)
-            if i == -1:
-                break
-            j = s.rfind("{", 0, i)
-            if j == -1:
-                break
+    """Remove non-text destination groups (font/colour/list tables, ``\\*``
+    groups, ``\\listtext``), honouring escaped braces."""
+    out = []
+    i = 0
+    n = len(s)
+    while i < n:
+        m = _GROUP_START.match(s, i)
+        if m and (m.group(1) == "*" or m.group(1) in _DESTINATIONS):
             depth = 0
-            k = j
-            while k < len(s):
-                if s[k] == "{":
+            while i < n:
+                c = s[i]
+                if c == "\\":
+                    i += 2  # skip the escaped character (incl. \\{ and \\})
+                    continue
+                if c == "{":
                     depth += 1
-                elif s[k] == "}":
+                elif c == "}":
                     depth -= 1
                     if depth == 0:
+                        i += 1
                         break
-                k += 1
-            if k < len(s):
-                s = s[:j] + s[k + 1:]
-            else:
-                break
-    return s
+                i += 1
+            continue
+        out.append(s[i])
+        i += 1
+    return "".join(out)
 
 
 def _parse_colortbl(s: str) -> List[Tuple[float, float, float]]:
@@ -99,6 +114,8 @@ def parse_rtf_runs(rtf) -> List[TextLine]:
 
     bold = italic = underline = strike = False
     cf = 2  # default colour index (GoodNotes uses ``\\cf2`` = black)
+    uc = 1  # fallback characters that follow a ``\\uN`` escape (``\\ucN``)
+    skip = 0
 
     def color() -> Tuple[float, float, float, float]:
         if 1 <= cf <= len(colors):
@@ -106,11 +123,12 @@ def parse_rtf_runs(rtf) -> List[TextLine]:
         return (0.0, 0.0, 0.0, 1.0)
 
     lines: List[TextLine] = [TextLine()]
+    fs: Optional[float] = None  # ``\\fsN`` = N half-points -> canvas units
     cur = TextRun("")  # the in-progress run (created with the flags in effect)
 
     def new_cur():
         nonlocal cur
-        cur = TextRun("", bold, italic, underline, strike, color())
+        cur = TextRun("", bold, italic, underline, strike, color(), size=fs)
 
     def finish_run():
         if cur.text:
@@ -134,24 +152,42 @@ def parse_rtf_runs(rtf) -> List[TextLine]:
                 strike = num != "0"; changed = True
             elif word == "cf":
                 cf = int(num) if num else cf; changed = True
+            elif word == "fs" and num:
+                fs = int(num) / 2.0; changed = True
             elif word in ("par", "n", "line"):
                 finish_run()
                 lines.append(TextLine())
                 continue
             elif word == "tab":
                 cur.text += "\t"
+            elif word == "uc":
+                uc = int(num) if num else 1
+            elif word == "u" and num:
+                cur.text += chr(int(num) % 65536)
+                skip = uc
             else:
                 continue  # \\fs, \\fN, \\sl, \\ansi, ... (not run attributes)
             if changed:
                 finish_run()  # close the run so the new attrs start a new one
             continue
+        if tok.group("parbreak") is not None:
+            finish_run()
+            lines.append(TextLine())
+            continue
+        if skip and (tok.group("hex") is not None or tok.group("char") is not None):
+            skip -= 1  # the ANSI fallback of a preceding \\uN
+            continue
         if tok.group("hex") is not None:
             cur.text += bytes.fromhex(tok.group("hex")).decode("cp1252", "replace")
         elif tok.group("char") is not None:
             cur.text += tok.group("char")
-        elif tok.group("nl") is not None:
-            cur.text += " "  # literal \n bytes are word separators, not breaks
-        # braces were flattened by the table-strip; ignore the rest
+        elif tok.group("sym") is not None:
+            sym = tok.group("sym")
+            if sym in "{}\\":
+                cur.text += sym
+            elif sym == "~":
+                cur.text += "\u00a0"
+        # raw line breaks and group braces carry no text
     finish_run()
 
     # trim blank padding lines, keep at least one
