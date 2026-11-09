@@ -781,3 +781,18 @@ def test_page_shows_its_page_of_a_multipage_paper(tmp_path):
     assert page.background_page == 2
     assert (page.width, page.height) == pytest.approx((300, 150))
     assert page.scale == pytest.approx(300 / 550)
+
+
+def test_image_attachment_prefers_header_f7():
+    from goodparse.records import PageObject
+    own, stored = "11111111-0000-0000-0000-000000000001", "22222222-0000-5000-8000-000000000002"
+    obj = PageObject("x", 1, b"", {}, header={4: [own.encode()], 7: [stored.encode()]})
+    assert obj.attachments == [stored, own]
+    assert PageObject("x", 1, b"", {}, header={4: [own.encode()]}).attachments == [own]
+
+
+def test_rtf_skips_destination_groups():
+    from goodparse.text_rtf import parse_rtf_runs
+    rtf = ("{\\rtf1{\\fonttbl\\f0 Helvetica;}{\\*\\listtable{\\list{\\*\\levelmarker \\{disc\\}}"
+           "{\\leveltext \\'01\\uc0\\u8226 ;}}}\n\\pard\\ls1 {\\listtext\t\\'95\t}\\'95\tItem \\{x\\}}")
+    assert [ln.text() for ln in parse_rtf_runs(rtf)] == ["•\tItem {x}"]

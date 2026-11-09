@@ -216,7 +216,7 @@ def _apply_fill(obj: PageObject, strokes: Dict[str, "Stroke"]) -> None:
 
 def _parse_image(obj: PageObject, attachments: Dict[str, bytes]) -> Optional[Image]:
     """Image object: attachment UUID in the header, placement matrix in the body."""
-    data = attachments.get(obj.attachment or "")
+    data = next((attachments[a] for a in obj.attachments if a in attachments), None)
     m = _matrix_from(obj.body)
     if not data or not m:
         return None

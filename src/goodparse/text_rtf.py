@@ -55,33 +55,41 @@ _TOKEN = re.compile(
 )
 
 
+# Destination groups whose content is not body text.  Any ``{\\* ...}`` group
+# is ignorable by definition; ``\\listtext`` holds a pre-rendered list marker
+# that Cocoa repeats in the paragraph text itself.
+_DESTINATIONS = ("fonttbl", "colortbl", "stylesheet", "listtable",
+                 "listoverridetable", "listtext", "info", "pict")
+_GROUP_START = re.compile(r"\{\\(\*|[a-zA-Z]+)")
+
+
 def _strip_table_groups(s: str) -> str:
-    """Remove ``{\\fonttbl ...}``, ``{\\colortbl ...}``, ``{\\*\\expandedcolortbl ...}``,
-    ``{\\stylesheet ...}`` groups (the opening brace precedes the marker)."""
-    for tbl in ("fonttbl", "colortbl", "expandedcolortbl", "stylesheet"):
-        marker = "\\" + tbl
-        while True:
-            i = s.find(marker)
-            if i == -1:
-                break
-            j = s.rfind("{", 0, i)
-            if j == -1:
-                break
+    """Remove non-text destination groups (font/colour/list tables, ``\\*``
+    groups, ``\\listtext``), honouring escaped braces."""
+    out = []
+    i = 0
+    n = len(s)
+    while i < n:
+        m = _GROUP_START.match(s, i)
+        if m and (m.group(1) == "*" or m.group(1) in _DESTINATIONS):
             depth = 0
-            k = j
-            while k < len(s):
-                if s[k] == "{":
+            while i < n:
+                c = s[i]
+                if c == "\\":
+                    i += 2  # skip the escaped character (incl. \\{ and \\})
+                    continue
+                if c == "{":
                     depth += 1
-                elif s[k] == "}":
+                elif c == "}":
                     depth -= 1
                     if depth == 0:
+                        i += 1
                         break
-                k += 1
-            if k < len(s):
-                s = s[:j] + s[k + 1:]
-            else:
-                break
-    return s
+                i += 1
+            continue
+        out.append(s[i])
+        i += 1
+    return "".join(out)
 
 
 def _parse_colortbl(s: str) -> List[Tuple[float, float, float]]:

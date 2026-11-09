@@ -6,7 +6,7 @@ pair per page object:
 * **header** — ``f1`` object UUID, ``f2`` version ``{f1 counter, f2 hash}``,
   ``f3 = 1`` when the object has been **deleted**, ``f9`` a Lamport-style
   sequence number, ``f16`` an object-class code (24 ink/shape, 25 pencil-layer
-  ink, 35 text), and — for images only — ``f4`` the attachment UUID;
+  ink, 35 text), and — for images only — ``f4`` / ``f7`` attachment UUIDs;
 * **body** — a message with exactly one field whose number is the object
   *kind* and whose value starts with the same UUID in its own ``f1``:
 
@@ -50,12 +50,19 @@ class PageObject:
     header: Dict[int, List[object]] = field(default_factory=dict)
 
     @property
-    def attachment(self) -> Optional[str]:
-        """Attachment UUID of an image object (header ``f4``)."""
-        v = self.header.get(4, [None])[0]
-        if isinstance(v, (bytes, bytearray)):
-            return bytes(v).decode("ascii", "ignore").strip() or None
-        return None
+    def attachments(self) -> List[str]:
+        """Candidate attachment UUIDs of an image object, most specific first.
+
+        Header ``f7`` (a derived, version-5 UUID) names the stored file when
+        present — e.g. images in pages copied from another notebook, whose own
+        id (``f4``) has no file of that name; otherwise header ``f4`` does.
+        """
+        out = []
+        for k in (7, 4):
+            v = _uuid(self.header.get(k, [None])[0])
+            if v:
+                out.append(v)
+        return out
 
 
 def _uuid(v) -> Optional[str]:
