@@ -26,7 +26,7 @@ import struct
 from typing import List, Tuple
 from xml.sax.saxutils import escape
 
-from .goodnotes import (
+from .model import (
     GoodNotesDocument,
     Image,
     Stroke,

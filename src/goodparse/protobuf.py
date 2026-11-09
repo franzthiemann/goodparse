@@ -66,20 +66,6 @@ def parse_message(data: bytes) -> Dict[int, List[object]]:
     return out
 
 
-def is_valid_message(data: bytes) -> bool:
-    """Return ``True`` if ``data`` parses cleanly as a protobuf message.
-
-    Used to decide whether a length-delimited field is a nested message or an
-    opaque byte string.
-    """
-    try:
-        for _ in iter_fields(data):
-            pass
-    except (IndexError, ValueError, struct.error):
-        return False
-    return True
-
-
 def read_length_delimited_records(data: bytes) -> List[bytes]:
     """Split a stream of ``<varint length><message>`` records.
 

@@ -23,7 +23,7 @@ from __future__ import annotations
 import json
 from typing import List, Tuple
 
-from .goodnotes import GoodNotesDocument, Stroke
+from .model import GoodNotesDocument, Stroke
 
 SCENE_SOURCE = "goodparse"
 

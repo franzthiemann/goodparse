@@ -27,7 +27,7 @@ import re
 import zlib
 from typing import Dict, List, Optional, Tuple
 
-from .goodnotes import GoodNotesDocument, Stroke, TextBox
+from .model import GoodNotesDocument, Stroke, TextBox
 from .base14_widths import WIDTHS
 from .text_rtf import TextLine, TextRun
 
