@@ -100,6 +100,9 @@ def _text_font_size(t: TextBox) -> float:
     return max(8.0, t.size[1] / (1.2 * nlines))
 
 
+# A text-object line wraps once it exceeds the stored width by this factor.
+_TEXT_WRAP_SLACK = 1.07
+
 # Base-14 stand-ins by family class.  GoodNotes names real families; without
 # an installed clone (see font_embed) the closest base-14 face is used.
 _BASE14 = {
@@ -284,14 +287,19 @@ def _emit_text(parts: List[str], t: TextBox, s: float, h: float,
     (Helvetica / Times / Courier).  Underlines and strikethroughs are thin
     vector lines under/through the run.
 
-    RTF text boxes wrap to their box width.  Text objects (explicit
-    ``font_size``) are laid out exactly as stored — GoodNotes' line breaks are
-    explicit — and only use the box width to honour a line's alignment.
+    Lines wrap at the box width.  For text objects (explicit ``font_size``)
+    that width is GoodNotes' own; since our fonts are close clones, not the
+    originals, a line only wraps once it exceeds it by more than
+    ``_TEXT_WRAP_SLACK`` (single-line labels measure 0.94-1.06x their stored
+    width, the lines GoodNotes really wrapped 1.34x and 1.66x).
     """
     box_fs = _text_font_size(t) * s
     x0 = t.position[0] * s
     box_w = t.size[0] * s
-    wrap_w = float("inf") if t.font_size > 0 else max(box_fs * 0.5, box_w)
+    if t.font_size > 0:
+        wrap_w = box_w * _TEXT_WRAP_SLACK if box_w > 0 else float("inf")
+    else:
+        wrap_w = max(box_fs * 0.5, box_w)
     lines = t.lines or [TextLine(runs=[TextRun(text=t.plain, color=t.color)])]
 
     def embedded(run):
@@ -310,14 +318,9 @@ def _emit_text(parts: List[str], t: TextBox, s: float, h: float,
             return e[1].width(seg) / 1000.0 * size_of(run)
         return _run_width(seg, size_of(run), _base14_key(run))
 
-    # Text objects store their laid-out content height, which is the real
-    # font's line height times the line count (e.g. 29 for 24 pt Helvetica
-    # Neue, 74 for 55 pt Futura): use it rather than guessing font metrics.
-    stored_line_h = (t.size[1] * s / len(lines)
-                     if t.font_size > 0 and t.size[1] > 0 else 0.0)
-    y = t.position[1] * s
+    # 1) Greedy wrap on word pieces (each keeps its surrounding whitespace).
+    layout: List[Tuple[str, List[Tuple[str, TextRun]]]] = []
     for line in lines:
-        # Greedy wrap on word pieces (each keeps its surrounding whitespace).
         vlines: List[List[Tuple[str, TextRun]]] = [[]]
         used = 0.0
         for run in line.runs:
@@ -328,42 +331,54 @@ def _emit_text(parts: List[str], t: TextBox, s: float, h: float,
                     seg = seg.lstrip()
                 vlines[-1].append((seg, run))
                 used += width(seg, run)
-        for vl in vlines:
-            fs_line = max((size_of(run) for _seg, run in vl), default=box_fs)
-            line_h = stored_line_h or fs_line * 1.2
-            baseline = h - (y + line_h * (0.8 if stored_line_h else 2 / 3))
-            y += line_h
-            if not vl:
-                continue
-            line_w = sum(width(seg, run) for seg, run in vl[:-1])
-            line_w += width(vl[-1][0].rstrip(), vl[-1][1])
-            cursor = x0
-            if box_w > 0 and line.align == "center":
-                cursor = x0 + (box_w - line_w) / 2.0
-            elif box_w > 0 and line.align == "right":
-                cursor = x0 + box_w - line_w
-            for seg, run in vl:
-                fs = size_of(run)
-                r, g, b, _a = run.color
-                parts.append(f"{_num(r)} {_num(g)} {_num(b)} rg")
-                emb = embedded(run)
-                if emb is not None:
-                    fname, ef = emb
-                    parts.append(f"/{fname} {fs:.2f} Tf")
-                    parts.append(f"BT {cursor:.2f} {baseline:.2f} Td <{ef.code(seg).hex()}> Tj ET")
-                else:
-                    fname = font_map[_base14_key(run)]
-                    parts.append(f"/{fname} {fs:.2f} Tf")
-                    parts.append(f"BT {cursor:.2f} {baseline:.2f} Td ({_pdf_escape(seg)}) Tj ET")
-                w = width(seg, run)
-                for flag, dy in ((run.underline, -0.12), (run.strike, 0.33)):
-                    if flag:
-                        ly = baseline + fs * dy
-                        parts.append(f"{_num(r)} {_num(g)} {_num(b)} RG")
-                        parts.append(f"{max(0.5, fs * 0.05):.2f} w "
-                                     f"{cursor:.2f} {ly:.2f} m "
-                                     f"{cursor + width(seg.rstrip(), run):.2f} {ly:.2f} l S")
-                cursor += w
+        layout.extend((line.align, vl) for vl in vlines)
+
+    # 2) Line heights.  Text objects store their laid-out content height,
+    #    i.e. the real font's line height summed over the lines (29 for one
+    #    24 pt Helvetica Neue line, 74 for 55 pt Futura); spread it in
+    #    proportion to each line's size instead of guessing font metrics.
+    sizes = [max((size_of(run) for _seg, run in vl), default=box_fs) for _a, vl in layout]
+    ratio = 0.0
+    if t.font_size > 0 and t.size[1] > 0 and sum(sizes) > 0:
+        ratio = t.size[1] * s / sum(sizes)
+
+    # 3) Emit.
+    y = t.position[1] * s
+    for (align, vl), fs_line in zip(layout, sizes):
+        line_h = fs_line * (ratio or 1.2)
+        baseline = h - (y + line_h * (0.8 if ratio else 2 / 3))
+        y += line_h
+        if not vl:
+            continue
+        line_w = sum(width(seg, run) for seg, run in vl[:-1])
+        line_w += width(vl[-1][0].rstrip(), vl[-1][1])
+        cursor = x0
+        if box_w > 0 and align == "center":
+            cursor = x0 + (box_w - line_w) / 2.0
+        elif box_w > 0 and align == "right":
+            cursor = x0 + box_w - line_w
+        for seg, run in vl:
+            fs = size_of(run)
+            r, g, b, _a = run.color
+            parts.append(f"{_num(r)} {_num(g)} {_num(b)} rg")
+            emb = embedded(run)
+            if emb is not None:
+                fname, ef = emb
+                parts.append(f"/{fname} {fs:.2f} Tf")
+                parts.append(f"BT {cursor:.2f} {baseline:.2f} Td <{ef.code(seg).hex()}> Tj ET")
+            else:
+                fname = font_map[_base14_key(run)]
+                parts.append(f"/{fname} {fs:.2f} Tf")
+                parts.append(f"BT {cursor:.2f} {baseline:.2f} Td ({_pdf_escape(seg)}) Tj ET")
+            w = width(seg, run)
+            for flag, dy in ((run.underline, -0.12), (run.strike, 0.33)):
+                if flag:
+                    ly = baseline + fs * dy
+                    parts.append(f"{_num(r)} {_num(g)} {_num(b)} RG")
+                    parts.append(f"{max(0.5, fs * 0.05):.2f} w "
+                                 f"{cursor:.2f} {ly:.2f} m "
+                                 f"{cursor + width(seg.rstrip(), run):.2f} {ly:.2f} l S")
+            cursor += w
 
 
 def _page_content(page, width_scale: float, alpha_name: Dict[float, str],

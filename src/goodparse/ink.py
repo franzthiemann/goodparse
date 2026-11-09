@@ -12,21 +12,25 @@ with no padding or alignment:
 * ``A(T)`` — a uint32 count followed by that many ``T``;
 * ``S(T...)`` — a struct of the listed members.
 
-Only four signatures occur across all samples (old and current GoodNotes):
+Only five signatures occur across all samples (old and current GoodNotes):
 
 ==========================================================  =================
 signature                                                    layout
 ==========================================================  =================
 ``vA(v)A(u)A(u)A(v)A(v)A(u)A(u)A(u)A(u)A(v)``                pressure pen
+``vuA(v)A(u)A(u)A(v)A(v)A(u)A(u)A(u)A(u)A(v)``               pressure (newer)
 ``vuA(v)A(S(uu))A(S(uuuu))vA(f)``                            uniform pen
 ``vuA(v)A(S(uu))A(S(uuuu))``                                 uniform (older)
 ``vuA(v)A(S(uuuuu))A(S(uuuuuuuuuuu))A(S(uu))A(v)...A(u)``    pencil
 ==========================================================  =================
 
-All describe one path as **node flags** plus point data.  A flag's low two
-bits are the node type — 0 *move to* (starts a sub-path), 1 *quadratic
-Bézier to* (control point + end point) — and bit 2 (value 4) means the node
-carries extra trailing floats (1 on a move, 3 on a segment; seen on tape).
+All describe one path as **node flags** plus point data.  Flag bit 0 is the
+node type — 0 *move to* (starts a sub-path), 1 *quadratic Bézier to*
+(control point + end point); bit 1 (value 2) stores a pressure segment
+coordinates-first ``(cx, cy, ex, ey, cr, er)`` instead of interleaved
+``(cx, cy, cr, ex, ey, er)`` (seen on a stroke split by the eraser, Test_12);
+bit 2 (value 4) adds trailing floats (1 on a move, 3 on a segment; tape).
+Each sub-path left by a partial erase starts with its own move node.
 The segments are *midpoint quadratic smoothing* of the raw pen samples: each
 control point is an input sample and each end point is exactly the midpoint
 of two consecutive controls (8,170 segments across the samples, p95 error
@@ -160,36 +164,37 @@ def _assemble(flags: Sequence[int], moves: List[Point],
     paths: List[List[Point]] = []
     mi = qi = 0
     for flag in flags:
-        kind = flag & 3
-        if kind == 0:
+        if flag > 7:
+            raise TemplateError(f"unknown node flag {flag}")
+        if flag & 1 == 0:
             if mi >= len(moves):
                 raise TemplateError("more move nodes than start points")
             paths.append([moves[mi]])
             mi += 1
-        elif kind == 1:
+        else:
             if qi >= len(quads) or not paths:
                 raise TemplateError("segment without data or start point")
             c, e = quads[qi]
             qi += 1
             _quad(paths[-1][-1], c, e, paths[-1])
-        else:
-            raise TemplateError(f"unknown node type {flag}")
     return [p for p in paths if p]
 
 
-def _pressure(vals: list) -> Ink:
-    flags, start, seg = vals[1], vals[2], vals[3]
+def _pressure(flags: Sequence[int], start: List[float], seg: List[float]) -> Ink:
     moves: List[Point] = []
     quads: List[Tuple[Point, Point]] = []
     si = gi = 0
     for flag in flags:
         extra = bool(flag & 4)
-        if flag & 3 == 0:
+        if flag & 1 == 0:
             x, y, r = start[si:si + 3]
             moves.append((x, y, 2.0 * r))
             si += 4 if extra else 3
         else:
-            cx, cy, cr, ex, ey, er = seg[gi:gi + 6]
+            if flag & 2:  # coordinates first: cx cy ex ey cr er
+                cx, cy, ex, ey, cr, er = seg[gi:gi + 6]
+            else:         # interleaved:       cx cy cr ex ey er
+                cx, cy, cr, ex, ey, er = seg[gi:gi + 6]
             quads.append(((cx, cy, 2.0 * cr), (ex, ey, 2.0 * er)))
             gi += 9 if extra else 6
     return Ink("pressure", _assemble(flags, moves, quads))
@@ -219,7 +224,9 @@ def decode_ink(raw: bytes) -> Optional[Ink]:
     (a vector shape's blob is a bare style template)."""
     sig, vals = read_template(raw)
     if sig.startswith("vA(v)A(u)A(u)"):
-        ink = _pressure(vals)
+        ink = _pressure(vals[1], vals[2], vals[3])
+    elif sig.startswith("vuA(v)A(u)A(u)"):  # newer: a (unused, -1) width first
+        ink = _pressure(vals[2], vals[3], vals[4])
     elif sig.startswith("vuA(v)A(S(uu))A(S(uuuu))"):
         ink = _uniform(vals)
     elif sig.startswith("vuA(v)A(S(uuuuu))A(S(uuuuuuuuuuu))"):

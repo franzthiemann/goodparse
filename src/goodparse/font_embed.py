@@ -60,28 +60,36 @@ def candidates_for(family: Optional[str]) -> Tuple[str, ...]:
     return _FAMILY_CANDIDATES.get((family or "").strip(), ())
 
 
-def _fc_match(query: str) -> Optional[str]:
-    """Resolve ``query`` (family[:style]) to a font file path via fontconfig."""
+def _fc_match(family: str, bold: bool, italic: bool) -> Optional[str]:
+    """Font file for ``family`` at the given style, via fontconfig.
+
+    ``fc-match`` always answers with *some* font, substituting an unrelated
+    default (e.g. Noto Sans) for a family that is not installed, so the match
+    is only accepted when fontconfig reports the requested family.
+    """
+    query = family + (":bold" if bold else "") + (":italic" if italic else "")
     try:
         out = subprocess.run(
-            ["fc-match", "-f", "%{file}", query],
+            ["fc-match", "-f", "%{family}\n%{file}", query],
             check=True, capture_output=True, timeout=10,
-        ).stdout.decode("ascii", "replace").strip()
+        ).stdout.decode("utf-8", "replace")
     except Exception:
         return None
-    return out or None
+    families, _, path = out.partition("\n")
+    if family.lower() not in (f.strip().lower() for f in families.split(",")):
+        return None
+    return path.strip() or None
 
 
 def find_font_file(family: str, bold: bool, italic: bool) -> Optional[str]:
     """Find an installed font file for ``family`` at the requested style.
 
-    Tries each candidate family (via ``fc-match`` with the style modifier) and
-    returns the first that resolves to a real font file.  ``None`` when none is
-    installed (caller then uses the base-14 fallback).
+    Tries each candidate clone family in order and returns the first that is
+    really installed.  ``None`` when none is (the caller then uses the base-14
+    fallback).
     """
-    style = ":bold" if bold else (":italic" if italic else "")
     for cand in candidates_for(family):
-        path = _fc_match(cand + style)
+        path = _fc_match(cand, bold, italic)
         if path and re.search(r"\.(ttf|otf|ttc)$", path, re.I):
             return path
     return None

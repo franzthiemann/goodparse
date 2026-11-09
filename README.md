@@ -139,7 +139,7 @@ Apple `libcompression` LZ4 blob (`bv41`…`bv4$`, decoder in
 [`applelz4.py`](src/goodparse/applelz4.py)) that decompresses to a
 **self-describing container**: `tpl\0`, a length, a type signature such as
 `vuA(v)A(S(uu))A(S(uuuu))vA(f)` (`v` u16, `u`/`f` 32-bit, `A(…)` counted array,
-`S(…)` struct, tightly packed), then the values. Four signatures cover every
+`S(…)` struct, tightly packed), then the values. Five signatures cover every
 sample: pressure pen (per-point half-width), uniform pen / marker /
 highlighter (one width), and pencil (x, y, tilt, pressure). Paths are node
 flags (move / quadratic segment) plus points; the segments are midpoint
@@ -154,8 +154,8 @@ and carries the fill RGBA.
 
 **Text** ([`richtext.py`](src/goodparse/richtext.py),
 [`text_rtf.py`](src/goodparse/text_rtf.py)). Text objects hold an LZ4 run blob
-(per-run text, colour, font family, size, weight, underline; per-paragraph
-alignment and list style, with `-404` meaning "inherit the default"). Older
+(per-run text, colour, font family, size, weight, italic, underline,
+strikethrough; per-paragraph alignment and list style, with `-404` meaning "inherit the default"). Older
 text boxes hold Cocoa RTF.
 
 **Pages** ([`archive.py`](src/goodparse/archive.py)). Page properties in the
@@ -186,10 +186,11 @@ Known gaps:
   only approximate.
 - **RTF text boxes** wrap at a narrower width than the stored box width; the
   exact wrap rule is not known yet.
-- Text-object character attributes seen so far: bold weight, underline,
-  colour, size, family. Italic and strikethrough in text objects have not
-  been observed in a sample yet.
-- Every sample uses the same canvas scale, so whether uniform widths are
+- GoodNotes indents list items slightly; the converter writes the bullet or
+  number at the paragraph's left edge.
+- Pencil with Apple Pencil pressure and tilt has only one sample (Test9);
+  a dedicated pencil calibration sample is still to come.
+- Every sample uses the same canvas scale (landscape pages too), so whether uniform widths are
   "0.5 pt" or "11/12 canvas units" per unit can't be told apart (identical at
   that scale).
 

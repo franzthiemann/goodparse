@@ -11,24 +11,29 @@ canvas units) and the content in ``f32``:
   set to the sentinel ``-404`` (or omits) inherits;
 * ``f32.f10`` — text inset ``{1: top, 2: left, 3: bottom, 4: right}``.
 
-Character attributes (``run.f2``), as observed in Test9 / Test_11:
+Character attributes (``run.f2``), as observed in Test9 / Test_11 / Test_12:
 
 ======  ====================================================================
+``f1``  strikethrough (1 = single)
 ``f2``  underline (1 = single)
 ``f3``  colour RGBA (float32 sub-fields 1..4)
 ``f30`` font family name (e.g. "Helvetica Neue", "Georgia", "Courier New")
 ``f40`` size (float32, canvas units)
 ``f60`` weight (signed varint): default -60, "Bold" -30
+``f50`` italic (1)
+``f60`` weight (signed varint): default -60, "Bold" -30
 ``f70`` unknown (default -20); ignored
 ======  ====================================================================
 
-Paragraph attributes (``run.f3``): ``f4`` alignment (2 = centred; absent =
-natural/left), ``f3`` list style — ``f3.f1`` = 1 numbered list, ``f3.f1``
-absent (but ``f3`` present and empty) = bullet list, ``-1`` = no list.
+Paragraph attributes (``run.f3``): ``f4`` alignment — absent = left, 2 =
+centre, 3 = right (Test_11, Test_12) — and ``f3`` list style: ``f3.f1`` = 1
+numbered list, ``f3.f1`` absent (``f3`` present but empty) = bullet list,
+``-1`` = no list.  A run's paragraph attributes belong to the paragraph its
+text is in: a run that is just the ``\n`` ending a paragraph carries that
+paragraph's style, not the next one's.
 
 Assumptions (flagged; only these values have been observed): weight > -60
-renders bold; alignment 1 = right (AppKit ``NSTextAlignment`` order, in which
-2 = centre matches the sample).
+renders bold; alignment 1 is taken as left and 4 (if it occurs) as justify.
 """
 
 from __future__ import annotations
@@ -44,7 +49,7 @@ RGBA = Tuple[float, float, float, float]
 
 _INHERIT = -404
 _DEFAULT_WEIGHT = -60
-_ALIGN = {0: "left", 1: "right", 2: "center", 3: "justify", 4: "left"}
+_ALIGN = {0: "left", 1: "left", 2: "center", 3: "right", 4: "justify"}
 
 
 @dataclass
@@ -90,10 +95,13 @@ class _Attrs:
     size: float = 24.0
     weight: int = _DEFAULT_WEIGHT
     underline: bool = False
+    italic: bool = False
+    strike: bool = False
 
     def apply(self, msg) -> "_Attrs":
         """A copy of these attributes overridden by a character-attribute msg."""
-        out = _Attrs(self.color, self.family, self.size, self.weight, self.underline)
+        out = _Attrs(self.color, self.family, self.size, self.weight,
+                     self.underline, self.italic, self.strike)
         if not isinstance(msg, (bytes, bytearray)):
             return out
         f = parse_message_tolerant(bytes(msg))
@@ -107,9 +115,10 @@ class _Attrs:
         weight = _first(f, 60)
         if isinstance(weight, int) and _signed(weight) != _INHERIT:
             out.weight = _signed(weight)
-        ul = _first(f, 2)
-        if isinstance(ul, int):
-            out.underline = ul != 0
+        for field_no, name in ((2, "underline"), (1, "strike"), (50, "italic")):
+            v = _first(f, field_no)
+            if isinstance(v, int):
+                setattr(out, name, v != 0)
         return out
 
 
@@ -168,29 +177,35 @@ def decode_text_object(body: bytes) -> Optional[TextObject]:
     size = _point(_first(f, 2)) or (0.0, 0.0)
 
     lines: List[TextLine] = [TextLine()]
-    numbers = 0
+    numbers = 0      # running number of a numbered list
+    started = False  # the current line has received its paragraph style
     for text, cattr, pattr in _runs(blob):
         attrs = defaults.apply(cattr)
         alignment, kind = _paragraph(pattr)
         for i, piece in enumerate(text.split("\n")):
             if i:
                 lines.append(TextLine())
+                started = False
+            if not piece:
+                continue
             line = lines[-1]
-            if not line.runs:
+            if not started:
+                # The first text of a paragraph carries its style.
+                started = True
                 line.align = alignment
+                numbers = numbers + 1 if kind == "numbered" else 0
                 if kind == "numbered":
-                    numbers += 1
                     piece = f"{numbers}. {piece}"
                 elif kind == "bullet":
-                    piece = "• " + piece
-                if kind != "numbered":
-                    numbers = 0
-            if piece:
-                line.runs.append(TextRun(
-                    text=piece, bold=attrs.weight > _DEFAULT_WEIGHT,
-                    underline=attrs.underline, color=attrs.color,
-                    font_family=attrs.family, size=attrs.size))
-    lines = [ln for ln in lines if ln.runs]
+                    piece = "\u2022 " + piece
+            line.runs.append(TextRun(
+                text=piece, bold=attrs.weight > _DEFAULT_WEIGHT,
+                italic=attrs.italic, underline=attrs.underline,
+                strike=attrs.strike, color=attrs.color,
+                font_family=attrs.family, size=attrs.size))
+    # Keep empty interior lines (blank paragraphs take vertical space).
+    while lines and not lines[-1].runs:
+        lines.pop()
     if not lines:
         return None
     return TextObject(position=(origin[0] + left, origin[1] + top), size=size,

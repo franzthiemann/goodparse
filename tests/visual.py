@@ -32,11 +32,21 @@ MISSING = 255.0  # score of a page that exists in only one of the two documents
 
 
 def _render(path: str) -> List[Image.Image]:
+    """Rasterise every page.  Pages and bitmaps are closed before their
+    document: closing a document under live child objects lets pdfium crash
+    when they are garbage-collected later."""
     pdf = pdfium.PdfDocument(path)
+    out = []
     try:
-        return [p.render(scale=DPI / 72).to_pil().convert("RGB") for p in pdf]
+        for i in range(len(pdf)):
+            page = pdf[i]
+            bitmap = page.render(scale=DPI / 72)
+            out.append(bitmap.to_pil().convert("RGB"))
+            bitmap.close()
+            page.close()
     finally:
         pdf.close()
+    return out
 
 
 def reference_samples() -> List[str]:

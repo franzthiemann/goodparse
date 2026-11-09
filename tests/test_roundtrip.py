@@ -625,7 +625,7 @@ def test_every_stroke_blob_parses_exactly():
         sig, _vals = read_template(raw)
         sigs.add(sig)
         decode_ink(raw)
-    assert len(sigs) == 4
+    assert len(sigs) == 5
 
 
 def test_ink_template_reader_packed_layout():
@@ -670,3 +670,40 @@ def test_base14_widths_are_real_metrics():
     assert _run_width("mi", 1000, ("Helvetica", True, False)) == 889 + 278
     assert _run_width("a", 1000, ("Times", False, False)) == 444
     assert _run_width("abc", 10, ("Courier", False, False)) == pytest.approx(18.0)
+
+
+def test_text_object_italic_strike_alignment_and_lists():
+    # Test_12 page 2: the same text twice; the lower box right-aligned with a
+    # centred "Bulltes" line.  "And numbers" is not a list item, although the
+    # newline ending the bullet line before it carries the bullet style.
+    doc = parse_goodnotes(sample("Test_12.goodnotes"))
+    left, right = sorted(doc.pages[1].texts, key=lambda t: t.position[1])
+    runs = {r.text: r for r in left.lines[0].runs}
+    assert runs["italic"].italic and not runs["italic"].strike
+    assert runs["strikethrough"].strike and not runs["strikethrough"].italic
+    assert runs["without"].bold and runs["without"].italic
+    assert runs["Space"].underline and runs["Space"].italic
+    assert [ln.align for ln in left.lines] == ["left"] * 7
+    assert [ln.align for ln in right.lines] == ["right", "right", "center"] + ["right"] * 4
+    texts = [ln.text() for ln in left.lines]
+    assert texts[5] == "And numbers"
+    assert texts[2].startswith("\u2022 ") and texts[6].startswith("\u2022 ")
+
+
+def test_eraser_split_stroke_has_separate_pieces():
+    # Test_12 page 3: one stroke cut by the pixel eraser is stored as one
+    # object with several move-to sub-paths (newer coordinates-first layout).
+    doc = parse_goodnotes(sample("Test_12.goodnotes"))
+    assert len(doc.pages[2].strokes) == 8
+
+
+def test_font_matcher_rejects_fontconfig_substitutes(monkeypatch):
+    import subprocess
+
+    import goodparse.font_embed as fe
+
+    class Out:
+        stdout = b"Noto Sans\n/usr/share/fonts/noto/NotoSans-Regular.ttf"
+
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: Out())
+    assert fe.find_font_file("Avenir", False, False) is None
