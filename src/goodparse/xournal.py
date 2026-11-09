@@ -11,7 +11,8 @@ element types used:
   embedded images (BASE64 is the raw PNG/JPEG, no data-URI prefix).
   Xournal++ only decodes rasters and *aborts loading the whole file* on
   anything else, so vector (PDF) stickers are rasterised to PNG first.
-* ``<text font size color x y wrap align>TEXT</text>`` for text boxes.
+* ``<text font size color x y>TEXT</text>`` for text: one element per
+  styled span of each laid-out line (see :func:`_text_xml`).
 
 Both GoodNotes and Xournal++ use a *top-left* origin with +y downward, so
 coordinates need no flip — only the canvas->page uniform scale is applied
@@ -30,12 +31,15 @@ import base64
 import gzip
 import hashlib
 import io
-import re
+import math
 import struct
 import warnings
 from typing import Dict, List, Optional, Tuple
 from xml.sax.saxutils import escape
 
+from .base14_widths import base14_key
+from .raster import image_raster
+from .textlayout import Segment, base14_width, layout_text
 from .model import (
     GoodNotesDocument,
     Image,
@@ -149,39 +153,6 @@ def _natural_size(data: bytes) -> Tuple[int, int]:
     return (0, 0)
 
 
-# Resolution of rasterised vector stickers, relative to their placed size.
-_STICKER_DPI = 300.0
-
-
-def _xopp_image_data(image: Image, scale: float) -> Optional[bytes]:
-    """PNG/JPEG bytes Xournal++ can decode, or ``None`` (with a warning)."""
-    data = image.data
-    if data[:8] == b"\x89PNG\r\n\x1a\n" or data[:2] == b"\xff\xd8":
-        return data
-    try:
-        if data[:4] == b"%PDF":
-            import pypdfium2 as pdfium
-            doc = pdfium.PdfDocument(data)
-            try:
-                page = doc[0]
-                k = _STICKER_DPI / 72.0 * image.size[0] * scale / page.get_width()
-                bitmap = page.render(scale=k, fill_color=(255, 255, 255, 0))
-                im = bitmap.to_pil()
-                bitmap.close()
-                page.close()
-            finally:
-                doc.close()
-        else:
-            from PIL import Image as PILImage
-            im = PILImage.open(io.BytesIO(data))
-        buf = io.BytesIO()
-        im.save(buf, format="PNG")
-        return buf.getvalue()
-    except Exception as exc:  # missing optional dependency or undecodable data
-        warnings.warn(f"skipping image Xournal++ cannot load: {exc}")
-        return None
-
-
 def _image_xml(image: Image, scale: float) -> str:
     """Emit an ``<image>`` element with the raster base64-encoded.
 
@@ -193,42 +164,89 @@ def _image_xml(image: Image, scale: float) -> str:
     w, h = image.size
     left, top = x * scale, y * scale
     right, bottom = (x + w) * scale, (y + h) * scale
-    data = _xopp_image_data(image, scale)
-    if data is None:
+    raster = image_raster(image, scale)
+    if raster is None:
         return ""
-    natural = _natural_size(data)
-    b64 = base64.b64encode(data).decode("ascii")
+    natural = (raster.width, raster.height) if raster.width else _natural_size(raster.data)
+    b64 = base64.b64encode(raster.data).decode("ascii")
     return (f'<image left="{_fmt(left)}" top="{_fmt(top)}" '
             f'right="{_fmt(right)}" bottom="{_fmt(bottom)}" '
             f'naturalSize="{natural[0]} {natural[1]}">{b64}</image>')
 
 
-def _estimate_font_size(text: TextBox) -> float:
-    """Canvas-unit size: explicit for text objects, else guessed from the RTF's
-    ``\\fs`` (half-points) or the box height."""
-    if text.font_size > 0:
-        return text.font_size
-    m = re.search(r"\\fs(\d+)", text.rtf)
-    if m:
-        return int(m.group(1)) / 2.0
-    # otherwise: box height is roughly 1.4x the font size for a single line
-    return max(8.0, text.size[1] / 1.4)
+# Distance from a <text> element's y to its baseline: Xournal++ (Pango, hinted
+# metrics) puts it at ceil(ascent * size) points.  Ascents measured in
+# Xournal++ 1.3.8 with the URW base-35 fonts that fontconfig resolves the
+# base-14 names to (Nimbus Sans / Roman / Mono PS); keyed by (class, italic,
+# bold-italic) since bold alone does not change them.
+_ASCENT = {"Helvetica": (0.730, 0.895, 0.895),
+           "Times": (0.680, 0.680, 0.695),
+           "Courier": (0.606, 0.606, 0.606)}
 
 
-def _text_xml(text: TextBox, scale: float) -> str:
-    """Emit a ``<text>`` element from a text box.
+def _font(key) -> Tuple[str, float]:
+    """Pango font name and ascent for a base-14 key ``(class, bold, italic)``."""
+    cls, bold, italic = key
+    name = cls + (" Bold" if bold else "") + (" Italic" if italic else "")
+    ascent = _ASCENT[cls][2 if bold and italic else 1 if italic else 0]
+    return name, ascent
 
-    ``x``/``y`` are the top-left in page points; ``wrap`` is the box width so
-    multi-line text wraps like the original.  The content is the plain
-    (RTF-stripped) text.
+
+def _spans(segments: List[Segment]) -> List[List[Segment]]:
+    """Consecutive word pieces of one font, size and colour (whitespace-only
+    pieces join the current span); spans without visible text dropped."""
+    def style(sg):
+        return (base14_key(sg.run), round(sg.size, 3), tuple(sg.run.color))
+    spans: List[List[Segment]] = []
+    for sg in segments:
+        if spans and (not sg.text.strip() or style(sg) == style(spans[-1][0])):
+            spans[-1].append(sg)
+        else:
+            spans.append([sg])
+    return [sp for sp in spans if any(sg.text.strip() for sg in sp)]
+
+
+def _text_xml(text: TextBox, scale: float) -> List[str]:
+    """``<text>`` elements for a text box, one per styled span of each line.
+
+    Placement comes from :func:`goodparse.textlayout.layout_text` (as for the
+    PDF); a Xournal++ text element has a single font, size and colour, and its
+    own line spacing could not reproduce GoodNotes', hence one element per
+    span and line.  Fonts are the base-14 classes (Helvetica / Times /
+    Courier) with bold and italic, which every fontconfig maps to
+    metric-compatible fonts; underline and strikethrough are thin strokes.
     """
-    x, y = text.position
-    size = _estimate_font_size(text) * scale
-    color = color_to_hex(text.color)
-    content = escape(text.plain)
-    return (f'<text font="Sans" size="{_fmt(size)}" color="{color}" '
-            f'x="{_fmt(x * scale)}" y="{_fmt(y * scale)}" '
-            f'wrap="{_fmt(text.size[0] * scale)}" align="left">{content}</text>')
+    out: List[str] = []
+    for line in layout_text(text, scale):
+        for span in _spans(line.segments):
+            first = span[0]
+            raw = "".join(sg.text for sg in span)
+            lead = raw[:len(raw) - len(raw.lstrip())]
+            x = first.x + base14_width(lead, first.run, first.size)
+            name, ascent = _font(base14_key(first.run))
+            y = line.baseline - math.ceil(ascent * first.size)
+            out.append(f'<text font="{name}" size="{_fmt(first.size)}" '
+                       f'color="{color_to_hex(first.run.color)}" x="{_fmt(x)}" '
+                       f'y="{_fmt(y)}">{escape(raw.strip())}</text>')
+        for sg in line.segments:
+            for flag, dy in ((sg.run.underline, 0.12), (sg.run.strike, -0.33)):
+                if flag and sg.text.strip():
+                    w = base14_width(sg.text.rstrip(), sg.run, sg.size)
+                    ly = line.baseline + sg.size * dy
+                    out.append(f'<stroke tool="pen" color="{color_to_hex(sg.run.color)}" '
+                               f'width="{_fmt(max(0.5, sg.size * 0.05))}">'
+                               f'{_fmt(sg.x)} {_fmt(ly)} {_fmt(sg.x + w)} {_fmt(ly)}</stroke>')
+    return out
+
+
+def _text_background_xml(text: TextBox, scale: float) -> str:
+    """A text box's fill colour as a filled, closed rectangle stroke."""
+    r, g, b, a = text.background
+    x0, y0 = text.position[0] * scale, text.position[1] * scale
+    x1, y1 = x0 + text.size[0] * scale, y0 + text.size[1] * scale
+    coords = " ".join(_fmt(v) for v in (x0, y0, x1, y0, x1, y1, x0, y1, x0, y0))
+    return (f'<stroke tool="pen" color="{color_to_hex((r, g, b, 1.0))}" '
+            f'fill="{round(max(0.0, min(1.0, a)) * 255)}" width="0.1">{coords}</stroke>')
 
 
 # Xournal++'s "attached" background: the PDF lives next to the document as
@@ -315,10 +333,13 @@ def build_xml(doc: GoodNotesDocument, width_scale: float = DEFAULT_WIDTH_SCALE,
             xml = _image_xml(image, page.scale)
             if xml:
                 lines.append(xml)
+        for text in page.texts:
+            if text.background is not None:
+                lines.append(_text_background_xml(text, page.scale))
         for stroke in page.strokes:
             lines.append(_stroke_xml(stroke, page.scale, width_scale))
         for text in page.texts:
-            lines.append(_text_xml(text, page.scale))
+            lines.extend(_text_xml(text, page.scale))
         lines.append("</layer>")
         lines.append("</page>")
     lines.append("</xournal>")

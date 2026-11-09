@@ -55,7 +55,11 @@ convert_file("notes.goodnotes", fmt="excalidraw")     # explicit format
 `notes.xopp` comes with `notes.xopp.bg.pdf`: the pages' paper (grid, lines,
 imported PDFs), copied as vectors into one PDF and attached the way Xournal++
 attaches an annotated PDF. Keep the two files side by side. Vector stickers
-are rasterised (Xournal++ only loads raster images). Xournal++ ignores colour
+are rasterised (Xournal++ only loads raster images). Text keeps its font
+class, bold, italic, size, colour and placement: one text element per styled
+span of each line (Xournal++ text has one style and its own line spacing),
+with underline and strikethrough as thin strokes and text-box fill colours as
+filled rectangles. Xournal++ ignores colour
 alpha, so highlighters become Xournal++ highlighters and pencil is blended
 onto white.
 
@@ -68,7 +72,8 @@ in excalidraw.com); the writer inverts that so every point keeps its width
 like the PDF: lines of one style form one multi-line element, mixed-style
 lines one element per span; underline and strikethrough are thin lines.
 Excalidraw has no bold, italic or serif text (runs use its Helvetica, or
-Cascadia for monospaced fonts). Pages are laid out top-to-bottom on the
+Cascadia for monospaced fonts). Photos and stickers are image elements and
+each page's paper a locked image beneath it. Pages are laid out top-to-bottom on the
 canvas, each outlined by a locked rectangle marking the page bounds. Colour
 alpha maps to element opacity.
 
@@ -127,6 +132,13 @@ covers all of these) and the optional `fontTools` dependency
 (`pip install "goodparse[pdf-fonts]"`) that does the subsetting/embedding. If
 the clone isn't installed, or `fontTools` is absent, the converter silently uses
 the base-14 fallback — the output is still valid, just with the stand-in face.
+
+Placement is shared by all three output formats
+([`textlayout.py`](src/goodparse/textlayout.py)). RTF text boxes are inset
+like UIKit text views: the text starts 10 canvas units inside the box's left
+and right edges (it also wraps there) and its first baseline sits
+`8 + 1.04 x size` below the box top — measured on every RTF box of the
+samples (sizes 24 and 18) and checked against a private document.
 
 
 ## Reverse-engineered format notes
@@ -216,13 +228,14 @@ Known gaps:
   empirical fit, ±24 %), pressure the opacity (`0.2 * sqrt(pressure)`).  The
   thin pencil is about twice as dense as that in the reference; with only two
   sizes measured this is not modelled.
-- **RTF text boxes** wrap at a narrower width than the stored box width; the
-  exact wrap rule is not known yet.
 - GoodNotes indents list items slightly; the converter writes the bullet or
   number at the paragraph's left edge.
-- **Xournal++ output** writes each text box as plain unstyled text.
-- **Excalidraw output** has no images or paper, and text loses bold, italic
-  and serif faces.
+- **Xournal++ text** is anchored at its top, and Xournal++ places the
+  baseline by the installed font's ascent: the measured ascents are those of
+  the URW fonts most Linux systems resolve Helvetica / Times / Courier to;
+  with other fonts installed, text can sit a few tenths of its size off.
+- **Excalidraw text** has no bold, italic or serif faces; paper and stickers
+  are rasters (paper at 144 dpi).
 - Every sample uses the same canvas scale (landscape pages too), so whether uniform widths are
   "0.5 pt" or "11/12 canvas units" per unit can't be told apart (identical at
   that scale).

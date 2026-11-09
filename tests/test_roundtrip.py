@@ -366,8 +366,9 @@ def test_test5_xopp_has_image_and_text(tmp_path):
     w, h = float(pages[0].get("width")), float(pages[0].get("height"))
     assert 0 < float(img.get("left")) < w
     assert 0 < float(img.get("top")) < h
-    # two text boxes on the same page
-    assert len(rich[0].findall(".//text")) == 2
+    # both text boxes on the same page, one element per styled span
+    texts = [t.text for t in rich[0].findall(".//text")]
+    assert "Hallo" in texts and "Strike" in texts and "italic" in texts
 
 
 def test_test5_pdf_full_fidelity(tmp_path):
@@ -1021,3 +1022,117 @@ def test_excalidraw_flow_text_keeps_line_pitch(tmp_path):
     assert heading["lineHeight"] * heading["fontSize"] == pytest.approx(29.3 * scale, rel=1e-3)
     paragraph = next(e for e in els if e["type"] == "text" and e["text"].startswith("I’m you"))
     assert paragraph["text"].count("\n") == 5
+
+
+
+# --------------------------------------------------------------------------- #
+# Raster media shared by Xournal++ and Excalidraw
+# --------------------------------------------------------------------------- #
+
+def _png(w, h):
+    import io
+    from PIL import Image as PILImage
+    buf = io.BytesIO()
+    PILImage.new("RGB", (w, h), (200, 30, 30)).save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def test_image_raster_turns_like_goodnotes():
+    pytest.importorskip("PIL")
+    from goodparse.model import Image
+    from goodparse.raster import image_raster
+    landscape = _png(200, 100)
+    same = image_raster(Image(data=landscape, position=(0, 0), size=(100, 50)), 1.0)
+    assert same.data == landscape                              # passed through
+    turned = image_raster(Image(data=landscape, position=(0, 0), size=(50, 100)), 1.0)
+    assert (turned.width, turned.height, turned.mime) == (100, 200, "image/png")
+
+
+def test_sticker_and_paper_rasters():
+    pdfium = pytest.importorskip("pypdfium2")
+    import io
+    from goodparse.model import Image
+    from goodparse.raster import PAPER_SCALE, image_raster, paper_raster
+    doc = pdfium.PdfDocument.new()
+    doc.new_page(100, 50)
+    doc.new_page(200, 100)
+    buf = io.BytesIO()
+    doc.save(buf)
+    pdf = buf.getvalue()
+    sticker = image_raster(Image(data=pdf, position=(0, 0), size=(72, 36)), 1.0)
+    assert sticker.mime == "image/png" and (sticker.width, sticker.height) == (300, 150)
+    paper = paper_raster(pdf, 1)
+    assert paper.mime == "image/jpeg" and paper.width == 200 * PAPER_SCALE
+
+
+# --------------------------------------------------------------------------- #
+# Xournal++ text styling
+# --------------------------------------------------------------------------- #
+
+def test_xopp_text_spans_keep_font_style_colour(tmp_path):
+    import math
+    from goodparse.textlayout import layout_text
+    from goodparse.xournal import _ASCENT
+    out = convert_file(sample("Test_12.goodnotes"), str(tmp_path / "t12.xopp"))
+    page = _xopp_root(out).findall("page")[1]
+    texts = {t.text: t for t in page.iter("text")}
+    assert texts["italic"].get("font") == "Helvetica Italic"
+    assert texts["bold"].get("font") == "Helvetica Bold"
+    assert texts["fonts"].get("font") == "Courier"
+    assert texts["colors"].get("color") == "#f7ca1dff"
+    assert float(texts["• With sizes"].get("size")) > 1.5 * float(texts["Return"].get("size"))
+    # the baseline lands where the shared layout puts it
+    doc = parse_goodnotes(sample("Test_12.goodnotes"))
+    box = doc.pages[1].texts[0]
+    first = layout_text(box, doc.pages[1].scale)[0]
+    want = first.baseline - math.ceil(_ASCENT["Helvetica"][0] * first.size)
+    assert any(abs(float(t.get("y")) - want) < 1e-3 for t in page.iter("text"))
+    rules = [s for s in page.iter("stroke") if len(s.text.split()) == 4
+             and s.text.split()[1] == s.text.split()[3]]
+    assert len(rules) == 6                                     # 2 strike + 4 underline
+
+
+def test_xopp_text_background_is_a_filled_rectangle():
+    from goodparse.model import TextBox
+    from goodparse.xournal import build_xml
+    page = Page(width=100, height=100)
+    page.texts.append(TextBox(position=(10, 10), size=(50, 20), rtf="", plain="x",
+                              color=(0, 0, 0, 1), background=(0.1, 0.2, 0.5, 1.0)))
+    (stroke,) = ET.fromstring(build_xml(GoodNotesDocument(pages=[page]))).iter("stroke")
+    assert stroke.get("fill") == "255" and stroke.get("color") == "#1a3380ff"
+    assert stroke.text.split()[:2] == stroke.text.split()[-2:]   # closed
+
+
+# --------------------------------------------------------------------------- #
+# Excalidraw images and paper
+# --------------------------------------------------------------------------- #
+
+def test_excalidraw_has_paper_and_images(tmp_path):
+    pytest.importorskip("pypdfium2")
+    out = convert_file(sample("Test5.goodnotes"), str(tmp_path / "t5.excalidraw"))
+    with open(out, encoding="utf-8") as fh:
+        scene = json.load(fh)
+    images = [e for e in scene["elements"] if e["type"] == "image"]
+    papers = [e for e in images if e["id"].endswith("-paper")]
+    assert len(papers) == 3 and all(e["locked"] for e in papers)
+    assert [e for e in images if not e["locked"]]              # the photo
+    assert {e["fileId"] for e in images} == set(scene["files"])
+    assert len(scene["files"]) < len(images)                   # shared paper stored once
+    for f in scene["files"].values():
+        assert f["dataURL"].startswith(f"data:{f['mimeType']};base64,")
+    # paper sits beneath everything else on its page
+    first = scene["elements"].index(papers[1])
+    assert scene["elements"][first + 1]["id"] == "page-2"
+
+
+def test_rtf_box_text_is_inset_like_goodnotes():
+    from goodparse.model import TextBox
+    from goodparse.text_rtf import parse_rtf_runs
+    from goodparse.textlayout import layout_text
+    rtf = r"{\rtf1\ansi{\fonttbl\f0 Helvetica;}\f0\fs48 Hello world}"
+    box = TextBox(position=(100, 200), size=(80, 60), rtf=rtf, plain="Hello world",
+                  color=(0, 0, 0, 1), lines=parse_rtf_runs(rtf.encode()))
+    lines = layout_text(box, 0.5)
+    assert lines[0].segments[0].x == pytest.approx((100 + 10) * 0.5)
+    assert lines[0].baseline == pytest.approx((200 + 8 + 1.04 * 24) * 0.5)
+    assert [ln.segments[0].text.strip() for ln in lines] == ["Hello", "world"]  # 60 wide

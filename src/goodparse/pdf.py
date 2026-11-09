@@ -30,6 +30,7 @@ from typing import Dict, List, Optional, Tuple
 from .model import GoodNotesDocument, Stroke, TextBox
 from .base14_widths import base14_font, base14_key, run_width
 from .text_rtf import TextRun
+from .raster import is_rotated
 from .textlayout import layout_text
 
 # Optional, heavier dependencies for raster media + text.  Kept optional so the
@@ -172,13 +173,8 @@ def _raster_to_jpeg(data: bytes, place_w: float = 0.0,
             rgb = im.convert("RGB")
     except Exception:
         return None
-    if place_w > 0 and place_h > 0:
-        native_ar = rgb.width / rgb.height
-        placed_ar = place_w / place_h
-        # |native - placed| large AND native*placed ~ 1 -> the axes are swapped,
-        # i.e. a 90-degree rotation.  0.15 catches 4:3/3:4, 16:9/9:16, etc.
-        if abs(native_ar - placed_ar) > 0.15 and abs(native_ar * placed_ar - 1.0) < 0.5:
-            rgb = rgb.rotate(270, expand=True)  # CCW 90 degrees
+    if is_rotated(rgb.width, rgb.height, place_w, place_h):
+        rgb = rgb.rotate(270, expand=True)  # CCW 90 degrees
     buf = io.BytesIO()
     rgb.save(buf, format="JPEG", quality=_JPEG_QUALITY)
     return rgb.width, rgb.height, buf.getvalue()

@@ -26,16 +26,24 @@ split into one element per styled span.  Excalidraw has no bold, italic or
 serif text: runs use its Helvetica (Cascadia for monospaced families);
 underline and strikethrough become thin ``line`` elements.  A text box's
 background colour becomes a filled rectangle beneath the ink.
+
+Photos and stickers become ``image`` elements, and each page's paper a
+locked image beneath everything (Excalidraw only shows rasters: paper is
+rendered at 144 dpi as JPEG, vector stickers at 300 dpi as PNG); the
+image data lives once per distinct file in the scene's ``files`` map.
 """
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
 import math
-from typing import List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from .base14_widths import base14_class
 from .model import GoodNotesDocument, Stroke, TextBox
+from .raster import Raster, image_raster, paper_raster
 from .textlayout import PlacedLine, Segment, base14_width, layout_text
 
 SCENE_SOURCE = "goodparse"
@@ -379,20 +387,87 @@ def _background_element(t: TextBox, element_id: str, index: int, offset_y: float
     return el
 
 
+def _image_element(element_id: str, index: int, x: float, y: float,
+                   width: float, height: float, file_id: str,
+                   locked: bool = False) -> dict:
+    el = _base_element(element_id, index)
+    el.update({
+        "type": "image",
+        "x": x,
+        "y": y,
+        "width": width,
+        "height": height,
+        "strokeColor": "transparent",
+        "backgroundColor": "transparent",
+        "strokeWidth": 1,
+        "fileId": file_id,
+        "status": "saved",
+        "scale": [1, 1],
+        "crop": None,
+        "locked": locked,
+    })
+    return el
+
+
+class _Files:
+    """The scene's ``files`` map: each distinct raster stored once, keyed by
+    its content hash (Excalidraw's own file ids are content hashes too)."""
+
+    def __init__(self) -> None:
+        self.files: Dict[str, dict] = {}
+
+    def add(self, raster: Raster) -> str:
+        file_id = hashlib.sha1(raster.data).hexdigest()
+        if file_id not in self.files:
+            self.files[file_id] = {
+                "mimeType": raster.mime,
+                "id": file_id,
+                "dataURL": f"data:{raster.mime};base64,"
+                           + base64.b64encode(raster.data).decode("ascii"),
+                "created": 0,
+                "lastRetrieved": 0,
+            }
+        return file_id
+
+
 def build_scene(doc: GoodNotesDocument, width_scale: float = 1.0) -> dict:
-    """Render the document model to an Excalidraw scene dict."""
+    """Render the document model to an Excalidraw scene dict.
+
+    Per page, bottom to top: the paper (a locked image, rendered like the PDF
+    writer's backgrounds), the page frame, photos and stickers, text-box
+    backgrounds, strokes, text.
+    """
     elements = []
+    files = _Files()
+    papers: Dict[Tuple[str, int], Optional[str]] = {}
     offset_y = 0.0
     for page_index, page in enumerate(doc.pages):
+        pid = f"p{page_index + 1}"
+        if page.background:
+            key = (hashlib.sha1(page.background).hexdigest(), page.background_page)
+            if key not in papers:
+                raster = paper_raster(page.background, page.background_page)
+                papers[key] = files.add(raster) if raster else None
+            if papers[key]:
+                elements.append(_image_element(f"{pid}-paper", len(elements), 0.0, offset_y,
+                                               page.width, page.height, papers[key],
+                                               locked=True))
         elements.append(_page_frame(page_index, len(elements), offset_y,
                                     page.width, page.height))
+        for image_index, image in enumerate(page.images):
+            raster = image_raster(image, page.scale)
+            if raster is not None:
+                elements.append(_image_element(
+                    f"{pid}-i{image_index + 1}", len(elements),
+                    image.position[0] * page.scale, image.position[1] * page.scale + offset_y,
+                    image.size[0] * page.scale, image.size[1] * page.scale, files.add(raster)))
         for text_index, text in enumerate(page.texts):
             if text.background is not None:
                 elements.append(_background_element(
-                    text, f"p{page_index + 1}-t{text_index + 1}-bg", len(elements),
+                    text, f"{pid}-t{text_index + 1}-bg", len(elements),
                     offset_y, page.scale))
         for stroke_index, stroke in enumerate(page.strokes):
-            sid = f"p{page_index + 1}-s{stroke_index + 1}"
+            sid = f"{pid}-s{stroke_index + 1}"
             if stroke.fill is not None:
                 elements.append(_fill_element(
                     stroke, sid + "-fill", len(elements), offset_y, page.scale))
@@ -400,7 +475,7 @@ def build_scene(doc: GoodNotesDocument, width_scale: float = 1.0) -> dict:
                 stroke, sid, len(elements), offset_y, width_scale, page.scale))
         for text_index, text in enumerate(page.texts):
             elements.extend(_text_elements(
-                text, f"p{page_index + 1}-t{text_index + 1}", len(elements),
+                text, f"{pid}-t{text_index + 1}", len(elements),
                 offset_y, page.scale))
         offset_y += page.height + PAGE_GAP
     return {
@@ -409,7 +484,7 @@ def build_scene(doc: GoodNotesDocument, width_scale: float = 1.0) -> dict:
         "source": SCENE_SOURCE,
         "elements": elements,
         "appState": {"gridSize": None, "viewBackgroundColor": "#ffffff"},
-        "files": {},
+        "files": files.files,
     }
 
 

@@ -31,6 +31,15 @@ from .text_rtf import TextLine, TextRun
 
 TEXT_WRAP_SLACK = 1.07
 
+# RTF text boxes (canvas units): GoodNotes insets the text RTF_INSET_X from
+# the box's left and right edges and puts the first baseline at
+# RTF_INSET_TOP + RTF_ASCENT * size below its top (UIKit text views inset
+# their text 8 at the top).  Measured against the references: every RTF box
+# of Test5/6/7 (size 24) and the size-18 boxes of a private document.
+RTF_INSET_X = 10.0
+RTF_INSET_TOP = 8.0
+RTF_ASCENT = 1.04
+
 # (segment text, run, font size in points) -> advance width in points
 WidthFn = Callable[[str, TextRun, float], float]
 
@@ -75,8 +84,10 @@ def layout_text(t: TextBox, scale: float, width: Optional[WidthFn] = None
     """Lay out text box ``t`` on a page with canvas->page ``scale``."""
     width = width or base14_width
     box_fs = default_font_size(t) * scale
-    x0 = t.position[0] * scale
-    box_w = t.size[0] * scale
+    rtf = t.font_size <= 0 and t.line_height <= 0
+    inset = RTF_INSET_X * scale if rtf else 0.0
+    x0 = t.position[0] * scale + inset
+    box_w = max(0.0, t.size[0] * scale - 2 * inset)
     if t.font_size > 0:
         wrap_w = box_w * TEXT_WRAP_SLACK if box_w > 0 else float("inf")
     else:
@@ -115,6 +126,10 @@ def layout_text(t: TextBox, scale: float, width: Optional[WidthFn] = None
     # 3) Positions.
     out: List[PlacedLine] = []
     y = t.position[1] * scale
+    if rtf and sizes:
+        # first baseline at RTF_INSET_TOP + RTF_ASCENT * size (the loop below
+        # adds 0.8 * size: 2/3 of a 1.2 x size line)
+        y += RTF_INSET_TOP * scale + (RTF_ASCENT - 0.8) * sizes[0]
     for j, ((align, vl), fs_line) in enumerate(zip(rows, sizes)):
         if t.line_height > 0:
             pitch = t.line_height * scale
