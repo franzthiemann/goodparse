@@ -46,9 +46,12 @@ class TextLine:
         return "".join(r.text for r in self.runs)
 
 
+# RTF tokens.  Raw CR/LF in the source are not text (RTF ignores them); a
+# backslash followed by a line break is a paragraph break, like ``\par``.
 _TOKEN = re.compile(
     r"\\(?P<word>[a-zA-Z]+)(?P<num>-?\d*) ?|\\'(?P<hex>[0-9a-fA-F]{2})|"
-    r"(?P<char>[^\{}\\\n])|(?P<nl>\n)|(?P<open>{)|(?P<close>})"
+    r"(?P<parbreak>\\\r?\n)|\\(?P<sym>[^a-zA-Z0-9'])|"
+    r"(?P<char>[^\{}\\\r\n])|(?P<nl>\r?\n)|(?P<open>{)|(?P<close>})"
 )
 
 
@@ -103,6 +106,8 @@ def parse_rtf_runs(rtf) -> List[TextLine]:
 
     bold = italic = underline = strike = False
     cf = 2  # default colour index (GoodNotes uses ``\\cf2`` = black)
+    uc = 1  # fallback characters that follow a ``\\uN`` escape (``\\ucN``)
+    skip = 0
 
     def color() -> Tuple[float, float, float, float]:
         if 1 <= cf <= len(colors):
@@ -144,18 +149,34 @@ def parse_rtf_runs(rtf) -> List[TextLine]:
                 continue
             elif word == "tab":
                 cur.text += "\t"
+            elif word == "uc":
+                uc = int(num) if num else 1
+            elif word == "u" and num:
+                cur.text += chr(int(num) % 65536)
+                skip = uc
             else:
                 continue  # \\fs, \\fN, \\sl, \\ansi, ... (not run attributes)
             if changed:
                 finish_run()  # close the run so the new attrs start a new one
             continue
+        if tok.group("parbreak") is not None:
+            finish_run()
+            lines.append(TextLine())
+            continue
+        if skip and (tok.group("hex") is not None or tok.group("char") is not None):
+            skip -= 1  # the ANSI fallback of a preceding \\uN
+            continue
         if tok.group("hex") is not None:
             cur.text += bytes.fromhex(tok.group("hex")).decode("cp1252", "replace")
         elif tok.group("char") is not None:
             cur.text += tok.group("char")
-        elif tok.group("nl") is not None:
-            cur.text += " "  # literal \n bytes are word separators, not breaks
-        # braces were flattened by the table-strip; ignore the rest
+        elif tok.group("sym") is not None:
+            sym = tok.group("sym")
+            if sym in "{}\\":
+                cur.text += sym
+            elif sym == "~":
+                cur.text += "\u00a0"
+        # raw line breaks and group braces carry no text
     finish_run()
 
     # trim blank padding lines, keep at least one

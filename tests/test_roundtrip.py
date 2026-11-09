@@ -651,3 +651,22 @@ def test_uniform_widths_match_reference_calibration():
     page = doc.pages[5]
     hl = sorted(s.points[0][2] * page.scale for s in page.strokes if s.color[3] == 0.5)
     assert hl == pytest.approx([6.0, 12.0, 16.11], abs=0.01)
+
+
+def test_rtf_line_breaks_and_run_spacing():
+    from goodparse.text_rtf import parse_rtf_runs
+    rtf = ("{\\rtf1{\\fonttbl\\f0 Helvetica;}\n\\f0\\fs48 A short \n\\i note\n"
+           "\\i0  of\\\nNext \\{x\\} \\uc0\\u8226 \\b bold}")
+    lines = parse_rtf_runs(rtf)
+    # the space after 舦 only delimits the control word: no space emitted
+    assert [ln.text() for ln in lines] == ["A short note of", "Next {x} •bold"]
+    assert [r.text for r in lines[0].runs] == ["A short ", "note", " of"]
+    assert lines[0].runs[1].italic and lines[1].runs[-1].bold
+
+
+def test_base14_widths_are_real_metrics():
+    from goodparse.pdf import _run_width
+    assert _run_width("mi", 1000) == 833 + 222                          # Helvetica
+    assert _run_width("mi", 1000, ("Helvetica", True, False)) == 889 + 278
+    assert _run_width("a", 1000, ("Times", False, False)) == 444
+    assert _run_width("abc", 10, ("Courier", False, False)) == pytest.approx(18.0)

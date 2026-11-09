@@ -28,6 +28,7 @@ import zlib
 from typing import Dict, List, Optional, Tuple
 
 from .goodnotes import GoodNotesDocument, Stroke, TextBox
+from .base14_widths import WIDTHS
 from .text_rtf import TextLine, TextRun
 
 # Optional, heavier dependencies for raster media + text.  Kept optional so the
@@ -99,31 +100,6 @@ def _text_font_size(t: TextBox) -> float:
     return max(8.0, t.size[1] / (1.2 * nlines))
 
 
-# Helvetica glyph advance widths (Adobe WinAnsi), in thousandths of an em.  Used
-# only to place underlines/strikethroughs under styled runs; a 0 entry means
-# "use the space width".
-_HELVETICA_ADV = {
-    0x20: 278, 0x21: 278, 0x22: 355, 0x23: 556, 0x24: 556, 0x25: 889,
-    0x26: 667, 0x27: 191, 0x28: 333, 0x29: 333, 0x2a: 389, 0x2b: 584,
-    0x2c: 278, 0x2d: 333, 0x2e: 278, 0x2f: 278, 0x30: 556, 0x31: 556,
-    0x32: 556, 0x33: 556, 0x34: 556, 0x35: 556, 0x36: 556, 0x37: 556,
-    0x38: 556, 0x39: 556, 0x3a: 278, 0x3b: 278, 0x3c: 584, 0x3d: 584,
-    0x3e: 584, 0x3f: 389, 0x40: 1015, 0x5b: 278, 0x5c: 278, 0x5d: 278,
-    0x5e: 469, 0x5f: 556, 0x60: 333, 0x7b: 278, 0x7c: 260, 0x7d: 278,
-    0x7e: 584,
-}
-for _c in range(0x41, 0x5B):  # A-Z
-    _HELVETICA_ADV[_c] = 667
-for _c in range(0x61, 0x7B):  # a-z
-    _HELVETICA_ADV[_c] = 556
-# a few real exceptions in the base-1000 Helvetica metrics
-for _c, _w in [(0x44, 722), (0x57, 944), (0x46, 611), (0x54, 611),
-               (0x56, 667), (0x59, 667), (0x67, 556), (0x6c, 278),
-               (0x69, 278), (0x6a, 278), (0x66, 333), (0x75, 556),
-               (0x2e, 278), (0x2c, 278)]:
-    _HELVETICA_ADV[_c] = _w
-
-
 # Base-14 stand-ins by family class.  GoodNotes names real families; without
 # an installed clone (see font_embed) the closest base-14 face is used.
 _BASE14 = {
@@ -156,17 +132,18 @@ def _base14_font(key: Tuple[str, bool, bool]) -> str:
     return _BASE14[cls][(1 if bold else 0) + (2 if italic else 0)]
 
 
-def _run_width(text: str, fs: float, cls: str = "Helvetica") -> float:
-    """Advance width of ``text`` in PDF points at font size ``fs``.
-
-    Courier is exactly 600/1000 em per glyph; Times is approximated with the
-    Helvetica advances (close enough to place underlines and centre lines).
-    """
+def _run_width(text: str, fs: float, key: Tuple[str, bool, bool] = ("Helvetica", False, False)) -> float:
+    """Advance width of ``text`` in PDF points at size ``fs`` in base-14 font
+    ``key`` (see :mod:`goodparse.base14_widths`)."""
+    cls, bold, italic = key
     if cls == "Courier":
         return len(text) * 0.6 * fs
-    total = 0.0
+    # Helvetica's obliques share the upright widths.
+    table = WIDTHS[_base14_font((cls, bold, italic and cls != "Helvetica"))]
+    total = 0
     for ch in text:
-        total += _HELVETICA_ADV.get(ord(ch), 556)
+        code = ch.encode("cp1252", "replace")[0]
+        total += table[code - 0x20] if 0x20 <= code <= 0xFF else table[0]
     return total / 1000.0 * fs
 
 
@@ -331,7 +308,7 @@ def _emit_text(parts: List[str], t: TextBox, s: float, h: float,
         e = embedded(run)
         if e:
             return e[1].width(seg) / 1000.0 * size_of(run)
-        return _run_width(seg, size_of(run), _base14_class(run.font_family))
+        return _run_width(seg, size_of(run), _base14_key(run))
 
     # Text objects store their laid-out content height, which is the real
     # font's line height times the line count (e.g. 29 for 24 pt Helvetica
