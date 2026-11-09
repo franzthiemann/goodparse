@@ -118,7 +118,7 @@ def test_convert_file_produces_valid_excalidraw(tmp_path):
     for s in strokes:
         # one pressure per point, first point at the element origin
         assert len(s["pressures"]) == len(s["points"]) >= 40
-        assert all(0.0 < p <= 1.0 for p in s["pressures"])
+        assert all(0.0 <= p <= 1.0 for p in s["pressures"])
         assert s["simulatePressure"] is False
         assert min(p[0] for p in s["points"]) == 0.0
         assert min(p[1] for p in s["points"]) == 0.0
@@ -947,3 +947,77 @@ def test_xournalpp_loads_converted_sample(tmp_path, name):
     subprocess.run(["xournalpp", f"--create-pdf={pdf}", xopp],
                    capture_output=True, timeout=300, check=True)
     assert pdf.stat().st_size > 0
+
+
+def test_xopp_paper_goes_to_attached_background_pdf(tmp_path):
+    pdfium = pytest.importorskip("pypdfium2")
+    out = convert_file(sample("Test9.goodnotes"), str(tmp_path / "t9.xopp"))
+    bg = pdfium.PdfDocument(out + ".bg.pdf")
+    backgrounds = list(_xopp_root(out).iter("background"))
+    pdf_bgs = [b for b in backgrounds if b.get("type") == "pdf"]
+    assert len(pdf_bgs) == len(backgrounds) == 7          # every page has paper
+    assert pdf_bgs[0].get("domain") == "attach" and pdf_bgs[0].get("filename") == "bg.pdf"
+    assert all(b.get("domain") is None for b in pdf_bgs[1:])
+    numbers = [int(b.get("pageno")) for b in pdf_bgs]
+    assert max(numbers) == len(bg) < len(numbers)          # shared paper stored once
+    page = bg[numbers[0] - 1]
+    assert page.get_size() == pytest.approx((595.28, 841.89), abs=0.01)
+
+
+@pytest.mark.skipif(not __import__("shutil").which("xournalpp"), reason="needs Xournal++")
+def test_xournalpp_draws_the_attached_paper(tmp_path):
+    import subprocess
+    pdfium = pytest.importorskip("pypdfium2")
+    xopp = convert_file(sample("Test4.goodnotes"), str(tmp_path / "t4.xopp"))
+    pdf = tmp_path / "out.pdf"
+    subprocess.run(["xournalpp", f"--create-pdf={pdf}", xopp],
+                   capture_output=True, timeout=300, check=True)
+    doc = pdfium.PdfDocument(str(pdf))
+    im = doc[0].render(scale=0.5).to_pil().convert("RGB")
+    assert im.getpixel((im.width - 5, im.height - 5)) != (255, 255, 255)   # cream paper
+
+
+# --------------------------------------------------------------------------- #
+# Excalidraw: stroke widths and text
+# --------------------------------------------------------------------------- #
+
+def test_excalidraw_freedraw_reproduces_widths():
+    from goodparse.excalidraw import _freedraw_element, _freehand_width
+    widths = [12 - 8 * i / 50 for i in range(51)]
+    el = _freedraw_element(Stroke(points=[(i * 4.0, 0.0, w) for i, w in enumerate(widths)],
+                                  color=(0, 0, 0, 1)), "a", 0, 0.0, 1.0)
+    drawn = [_freehand_width(el["strokeWidth"], p) for p in el["pressures"]]
+    assert drawn == pytest.approx(widths, abs=1e-3)
+    # widths measured in excalidraw.com: 8x / 6x / 4.5x strokeWidth
+    assert [_freehand_width(1.0, p) for p in (1, 0.5, 0.25)] == pytest.approx([8, 6, 4.5], abs=0.1)
+
+
+def _scene(name, tmp_path):
+    out = convert_file(sample(f"{name}.goodnotes"), str(tmp_path / f"{name}.excalidraw"))
+    with open(out, encoding="utf-8") as fh:
+        return json.load(fh)["elements"]
+
+
+def test_excalidraw_has_text_with_styles_and_rules(tmp_path):
+    els = _scene("Test_12", tmp_path)
+    texts = {e["text"]: e for e in els if e["type"] == "text"}
+    assert "Text with italic strikethrough\nunderline bold withoutSpace\nReturn\n• Bulltes" in texts
+    sizes = texts["• With sizes"]
+    assert sizes["fontSize"] > 1.5 * texts["And numbers"]["fontSize"]
+    assert sizes["strokeColor"] == "#4cc64e"
+    assert texts["fonts"]["fontFamily"] == 3                     # monospaced run
+    assert {e["textAlign"] for e in texts.values()} >= {"left", "center", "right"}
+    assert sum(e["type"] == "line" and e["height"] == 0 for e in els) == 6  # 2x strike + 4x underline
+    for e in texts.values():
+        assert e["originalText"] == e["text"] and e["containerId"] is None
+
+
+def test_excalidraw_flow_text_keeps_line_pitch(tmp_path):
+    els = _scene("Test_13", tmp_path)
+    heading = next(e for e in els if e["type"] == "text" and e["text"].startswith("This text"))
+    assert heading["text"].count("\n") == 1
+    scale = parse_goodnotes(sample("Test_13.goodnotes")).pages[1].scale
+    # "start typing" lines are 29.3 canvas units apart, whatever the font size
+    assert heading["lineHeight"] * heading["fontSize"] == pytest.approx(29.3 * scale, rel=1e-3)
+    paragraph = next(e for e in els if e["type"] == "text" and e["text"].startswith("I’m you"))
+    assert paragraph["text"].count("\n") == 5

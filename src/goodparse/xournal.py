@@ -17,17 +17,23 @@ Both GoodNotes and Xournal++ use a *top-left* origin with +y downward, so
 coordinates need no flip — only the canvas->page uniform scale is applied
 (see :class:`~goodparse.goodnotes.Page.scale`).  Page size comes from the
 embedded paper PDF when present, else A4.
+
+The paper itself is written beside the document as ``<name>.xopp.bg.pdf``
+— Xournal++'s own *attached background PDF* — and each page's
+``<background type="pdf" pageno="N"/>`` shows its page of it (vector, not
+rasterised; see :func:`background_pdf`).
 """
 
 from __future__ import annotations
 
 import base64
 import gzip
+import hashlib
 import io
 import re
 import struct
 import warnings
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 from xml.sax.saxutils import escape
 
 from .model import (
@@ -225,16 +231,84 @@ def _text_xml(text: TextBox, scale: float) -> str:
             f'wrap="{_fmt(text.size[0] * scale)}" align="left">{content}</text>')
 
 
-def build_xml(doc: GoodNotesDocument, width_scale: float = DEFAULT_WIDTH_SCALE) -> str:
-    """Render the document model to Xournal++ XML."""
+# Xournal++'s "attached" background: the PDF lives next to the document as
+# ``<name>.xopp.bg.pdf`` and the first PDF page background names it "bg.pdf".
+BACKGROUND_SUFFIX = ".bg.pdf"
+
+
+def background_pdf(doc: GoodNotesDocument) -> Tuple[Optional[bytes], List[Optional[int]]]:
+    """Collect the pages' paper into one PDF for Xournal++.
+
+    Xournal++ takes a single background PDF per document, while GoodNotes
+    pages each show a page of their own paper PDF; so every distinct
+    (paper, page) is copied — as vectors — into one merged PDF.  Returns its
+    bytes (``None`` when no page has paper, or pypdfium2 is missing) and,
+    per page, the 1-based page number in it (``None``: no paper).
+    """
+    if not any(p.background for p in doc.pages):
+        return None, [None] * len(doc.pages)
+    try:
+        import pypdfium2 as pdfium
+    except ImportError:
+        warnings.warn("pypdfium2 missing: Xournal++ pages get no paper background")
+        return None, [None] * len(doc.pages)
+    merged = pdfium.PdfDocument.new()
+    sources: Dict[str, object] = {}
+    placed: Dict[Tuple[str, int], int] = {}
+    numbers: List[Optional[int]] = []
+    try:
+        for page in doc.pages:
+            if not page.background:
+                numbers.append(None)
+                continue
+            key = hashlib.sha1(page.background).hexdigest()
+            try:
+                if key not in sources:
+                    sources[key] = pdfium.PdfDocument(page.background)
+                src = sources[key]
+                index = page.background_page if page.background_page < len(src) else 0
+                if (key, index) not in placed:
+                    merged.import_pages(src, [index])
+                    placed[(key, index)] = len(merged)
+                numbers.append(placed[(key, index)])
+            except pdfium.PdfiumError as exc:
+                warnings.warn(f"unreadable paper PDF, page left plain: {exc}")
+                numbers.append(None)
+        if not placed:
+            return None, numbers
+        buf = io.BytesIO()
+        merged.save(buf)
+        return buf.getvalue(), numbers
+    finally:
+        merged.close()
+        for src in sources.values():
+            src.close()
+
+
+def build_xml(doc: GoodNotesDocument, width_scale: float = DEFAULT_WIDTH_SCALE,
+              background_pages: Optional[List[Optional[int]]] = None) -> str:
+    """Render the document model to Xournal++ XML.
+
+    ``background_pages`` (from :func:`background_pdf`) gives each page's page
+    in the attached background PDF; without it every page is plain white.
+    """
     lines = [
         '<?xml version="1.0" standalone="no"?>',
         f'<xournal creator="{CREATOR}" fileversion="{FILE_VERSION}">',
         f"<title>{escape(doc.title)}</title>",
     ]
-    for page in doc.pages:
+    attached = False
+    for i, page in enumerate(doc.pages):
         lines.append(f'<page width="{_fmt(page.width)}" height="{_fmt(page.height)}">')
-        lines.append('<background type="solid" color="white" style="plain"/>')
+        pageno = background_pages[i] if background_pages else None
+        if pageno is None:
+            lines.append('<background type="solid" color="white" style="plain"/>')
+        elif not attached:
+            attached = True
+            lines.append(f'<background type="pdf" domain="attach" filename="bg.pdf" '
+                         f'pageno="{pageno}"/>')
+        else:
+            lines.append(f'<background type="pdf" pageno="{pageno}"/>')
         lines.append("<layer>")
         # images first, so the ink renders on top
         for image in page.images:
@@ -253,7 +327,13 @@ def build_xml(doc: GoodNotesDocument, width_scale: float = DEFAULT_WIDTH_SCALE) 
 
 def write_xopp(doc: GoodNotesDocument, path: str,
                width_scale: float = DEFAULT_WIDTH_SCALE) -> None:
-    """Write the document to a gzip-compressed ``.xopp`` file."""
-    xml = build_xml(doc, width_scale)
+    """Write the document to a gzip-compressed ``.xopp`` file, plus its paper
+    as ``<path>.bg.pdf`` (Xournal++'s attached background PDF) when any page
+    has one.  Keep the two files together."""
+    bg, numbers = background_pdf(doc)
+    if bg is not None:
+        with open(path + BACKGROUND_SUFFIX, "wb") as fh:
+            fh.write(bg)
+    xml = build_xml(doc, width_scale, numbers if bg is not None else None)
     with gzip.open(path, "wb") as fh:
         fh.write(xml.encode("utf-8"))

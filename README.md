@@ -23,7 +23,7 @@ pip install -e .
 ### CLI
 
 ```bash
-goodparse notes.goodnotes                    # -> notes.xopp
+goodparse notes.goodnotes                    # -> notes.xopp (+ notes.xopp.bg.pdf)
 goodparse notes.goodnotes -o out.xopp        # explicit output
 goodparse notes.goodnotes -o out.excalidraw  # format from extension
 goodparse notes.goodnotes -f excalidraw      # -> notes.excalidraw
@@ -50,14 +50,27 @@ convert_file("notes.goodnotes", "notes.pdf")
 convert_file("notes.goodnotes", fmt="excalidraw")     # explicit format
 ```
 
+### Xournal++ export
+
+`notes.xopp` comes with `notes.xopp.bg.pdf`: the pages' paper (grid, lines,
+imported PDFs), copied as vectors into one PDF and attached the way Xournal++
+attaches an annotated PDF. Keep the two files side by side. Vector stickers
+are rasterised (Xournal++ only loads raster images). Xournal++ ignores colour
+alpha, so highlighters become Xournal++ highlighters and pencil is blended
+onto white.
+
 ### Excalidraw export
 
-Each stroke becomes a `freedraw` element: GoodNotes' per-point widths map to
-Excalidraw pressures (with `strokeWidth` set to the stroke's maximum width),
-so thin/thick pens and pressure tapering are preserved, though Excalidraw's
-freehand renderer makes the exact thickness an approximation. Pages are laid
-out top-to-bottom on the canvas, each outlined by a locked rectangle marking
-the page bounds. Colour alpha maps to element opacity.
+Each stroke becomes a `freedraw` element. Excalidraw draws a point of
+pressure `p` `8.5 * strokeWidth * sin(pi/2 * (0.2 + 0.6 p))` wide (measured
+in excalidraw.com); the writer inverts that so every point keeps its width
+(down to 0.32x the stroke's maximum). Text becomes `text` elements laid out
+like the PDF: lines of one style form one multi-line element, mixed-style
+lines one element per span; underline and strikethrough are thin lines.
+Excalidraw has no bold, italic or serif text (runs use its Helvetica, or
+Cascadia for monospaced fonts). Pages are laid out top-to-bottom on the
+canvas, each outlined by a locked rectangle marking the page bounds. Colour
+alpha maps to element opacity.
 
 ### PDF export
 
@@ -207,12 +220,9 @@ Known gaps:
   exact wrap rule is not known yet.
 - GoodNotes indents list items slightly; the converter writes the bullet or
   number at the paragraph's left edge.
-- **Xournal++ output** has no paper background (pages are plain white) and
-  writes each text box as plain unstyled text.  Xournal++ ignores colour
-  alpha, so highlighters use its highlighter tool (fixed opacity) and pencil
-  is pre-blended onto white.
-- **Excalidraw output** holds strokes and shapes only (no text, images or
-  paper).
+- **Xournal++ output** writes each text box as plain unstyled text.
+- **Excalidraw output** has no images or paper, and text loses bold, italic
+  and serif faces.
 - Every sample uses the same canvas scale (landscape pages too), so whether uniform widths are
   "0.5 pt" or "11/12 canvas units" per unit can't be told apart (identical at
   that scale).
