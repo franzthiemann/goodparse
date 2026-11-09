@@ -92,6 +92,7 @@ class Page:
     # Raw bytes of this page's background ("paper") PDF, or None.  Background
     # PDFs are stored as attachments and define the page size.
     background: Optional[bytes] = None
+    background_page: int = 0  # 0-based page of ``background`` to show
 
 
 @dataclass

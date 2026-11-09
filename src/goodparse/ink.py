@@ -18,7 +18,8 @@ Only five signatures occur across all samples (old and current GoodNotes):
 signature                                                    layout
 ==========================================================  =================
 ``vA(v)A(u)A(u)A(v)A(v)A(u)A(u)A(u)A(u)A(v)``                pressure pen
-``vuA(v)A(u)A(u)A(v)A(v)A(u)A(u)A(u)A(u)A(v)``               pressure (newer)
+``vuA(v)A(u)A(u)A(v)A(v)A(u)A(u)A(u)A(u)A(v)``               pressure (newer,
+                                                             default width)
 ``vuA(v)A(S(uu))A(S(uuuu))vA(f)``                            uniform pen
 ``vuA(v)A(S(uu))A(S(uuuu))``                                 uniform (older)
 ``vuA(v)A(S(uuuuu))A(S(uuuuuuuuuuu))A(S(uu))A(v)...A(u)``    pencil
@@ -26,10 +27,9 @@ signature                                                    layout
 
 All describe one path as **node flags** plus point data.  Flag bit 0 is the
 node type — 0 *move to* (starts a sub-path), 1 *quadratic Bézier to*
-(control point + end point); bit 1 (value 2) stores a pressure segment
-coordinates-first ``(cx, cy, ex, ey, cr, er)`` instead of interleaved
-``(cx, cy, cr, ex, ey, er)`` (seen on a stroke split by the eraser, Test_12);
-bit 2 (value 4) adds trailing floats (1 on a move, 3 on a segment; tape).
+(control point + end point); in the newer pressure layout bit 1 (value 2)
+marks a node that carries its own width (see :func:`_pressure`); bit 2
+(value 4) adds trailing floats (1 on a move, 3 on a segment; tape).
 Each sub-path left by a partial erase starts with its own move node.
 The segments are *midpoint quadratic smoothing* of the raw pen samples: each
 control point is an input sample and each end point is exactly the midpoint
@@ -180,23 +180,46 @@ def _assemble(flags: Sequence[int], moves: List[Point],
     return [p for p in paths if p]
 
 
-def _pressure(flags: Sequence[int], start: List[float], seg: List[float]) -> Ink:
+def _pressure(flags: Sequence[int], start: List[float], seg: List[float],
+              default_r: Optional[float] = None) -> Ink:
+    """Pressure-pen nodes.
+
+    Older layout (``default_r`` None): every node carries its half-width,
+    interleaved — move ``(x, y, r)``, segment ``(cx, cy, cr, ex, ey, er)``.
+    Newer layout: a node carries its own half-width only when flag bit 1 is
+    set — move ``(x, y[, r])``, segment ``(cx, cy, ex, ey[, cr, er])`` — and
+    otherwise uses the stroke's leading half-width ``default_r`` (stored as -1
+    when every node has its own).  Bit 2 appends extra floats in both.  The
+    flags must consume both arrays exactly.
+    """
+    newer = default_r is not None
     moves: List[Point] = []
     quads: List[Tuple[Point, Point]] = []
     si = gi = 0
     for flag in flags:
         extra = bool(flag & 4)
+        own = not newer or bool(flag & 2)
         if flag & 1 == 0:
-            x, y, r = start[si:si + 3]
+            if newer:
+                x, y = start[si:si + 2]
+                r = start[si + 2] if own else default_r
+            else:
+                x, y, r = start[si:si + 3]
             moves.append((x, y, 2.0 * r))
-            si += 4 if extra else 3
+            si += (3 if own else 2) + (1 if extra else 0)
         else:
-            if flag & 2:  # coordinates first: cx cy ex ey cr er
-                cx, cy, ex, ey, cr, er = seg[gi:gi + 6]
-            else:         # interleaved:       cx cy cr ex ey er
+            if not newer:
                 cx, cy, cr, ex, ey, er = seg[gi:gi + 6]
+            elif own:
+                cx, cy, ex, ey, cr, er = seg[gi:gi + 6]
+            else:
+                cx, cy, ex, ey = seg[gi:gi + 4]
+                cr = er = default_r
             quads.append(((cx, cy, 2.0 * cr), (ex, ey, 2.0 * er)))
-            gi += 9 if extra else 6
+            gi += (6 if own else 4) + (3 if extra else 0)
+    if si != len(start) or gi != len(seg):
+        raise TemplateError(
+            f"node flags consume {si}/{gi} of {len(start)}/{len(seg)} floats")
     return Ink("pressure", _assemble(flags, moves, quads))
 
 
@@ -225,8 +248,8 @@ def decode_ink(raw: bytes) -> Optional[Ink]:
     sig, vals = read_template(raw)
     if sig.startswith("vA(v)A(u)A(u)"):
         ink = _pressure(vals[1], vals[2], vals[3])
-    elif sig.startswith("vuA(v)A(u)A(u)"):  # newer: a (unused, -1) width first
-        ink = _pressure(vals[2], vals[3], vals[4])
+    elif sig.startswith("vuA(v)A(u)A(u)"):  # newer: default half-width first
+        ink = _pressure(vals[2], vals[3], vals[4], default_r=vals[1])
     elif sig.startswith("vuA(v)A(S(uu))A(S(uuuu))"):
         ink = _uniform(vals)
     elif sig.startswith("vuA(v)A(S(uuuuu))A(S(uuuuuuuuuuu))"):

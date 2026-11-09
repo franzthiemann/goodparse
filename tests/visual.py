@@ -17,6 +17,7 @@ which writes ``OUTDIR/<name>_p<N>.png`` (left = reference, right = ours).
 from __future__ import annotations
 
 import os
+import subprocess
 import sys
 import tempfile
 from typing import List, Optional
@@ -49,12 +50,27 @@ def _render(path: str) -> List[Image.Image]:
     return out
 
 
+def committed_samples() -> List[str]:
+    """``.goodnotes`` files in ``samples/`` that are tracked by git.
+
+    Private documents may sit in ``samples/`` for manual runs (kept out of
+    git via ``.git/info/exclude``); the test suite only covers committed
+    ones.  Outside a git checkout every sample counts.
+    """
+    try:
+        out = subprocess.run(["git", "ls-files", "--", "*.goodnotes"], cwd=SAMPLES,
+                             check=True, capture_output=True, text=True).stdout
+        return sorted(os.path.basename(f) for f in out.split())
+    except (OSError, subprocess.CalledProcessError):
+        return sorted(f for f in os.listdir(SAMPLES) if f.endswith(".goodnotes"))
+
+
 def reference_samples() -> List[str]:
-    """Sample names (no extension) that have a GoodNotes reference PDF."""
+    """Committed sample names (no extension) with a GoodNotes reference PDF."""
     names = []
-    for f in sorted(os.listdir(SAMPLES)):
-        stem, ext = os.path.splitext(f)
-        if ext == ".goodnotes" and os.path.exists(os.path.join(SAMPLES, stem + ".pdf")):
+    for f in committed_samples():
+        stem = os.path.splitext(f)[0]
+        if os.path.exists(os.path.join(SAMPLES, stem + ".pdf")):
             names.append(stem)
     return names
 

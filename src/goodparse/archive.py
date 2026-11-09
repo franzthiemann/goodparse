@@ -9,7 +9,13 @@ layers' canvas size and paper.  ``index.notes.pb`` lists the page members.
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
+
+try:  # optional: exact per-page size of multi-page paper PDFs
+    import pypdfium2 as _pdfium
+except Exception:  # pragma: no cover
+    _pdfium = None
 
 from .model import Page
 from .page import parse_page
@@ -88,38 +94,54 @@ def _read_page_order(opener, names, fallback) -> List[str]:
     return ordered
 
 
+@dataclass
+class PageMeta:
+    """What the event log says about one page."""
+
+    member: Optional[str]                    # "notes/<UUID>" (None: no file)
+    layer: Optional[str]
+    canvas: Optional[Tuple[float, float]]    # canvas (w, h) in canvas units
+    paper: Optional[str]                     # paper (attachment) UUID
+    paper_page: int = 0                      # 0-based page of the paper PDF
+
+
 def _read_page_members(opener, names, attachments) -> List[Page]:
     """Parse every live ``notes/<UUID>`` member in display order, keeping
     empty pages (a page may hold only a background).
 
     Per-page geometry and paper come from the event log (see
     :func:`_read_page_meta`): each page has its own canvas, so documents can
-    mix page sizes (A4 + landscape + strips).  A page the log does not
-    describe falls back to A4 at scale 1.
+    mix page sizes (A4 + landscape + strips) and show different pages of one
+    imported PDF.  A page the log does not describe falls back to A4 at
+    scale 1.
     """
     member_names = _page_members(names)
-    meta = _read_page_meta(opener, names, member_names)
-    per_page = {m.split("/")[-1]: (c, p) for m, _layer, c, p in meta if m}
+    meta = [m for m in _read_page_meta(opener, names, member_names) if m.member]
+    per_page = {m.member: m for m in meta}
 
-    order: List[str] = [m for m, _l, _c, _p in meta if m]
+    order: List[str] = [m.member for m in meta]
     for m in _read_page_order(opener, names, member_names):  # pages not in the log
         if m not in order:
             order.append(m)
 
     deleted = set(_read_deleted_pages(opener, names))
     paper_att = _read_paper_to_attachment(opener, names)
+    sizes = _PaperSizes(attachments)
 
     pages = []
     for name in order:
         if name in deleted:
             continue
-        canvas, paper = per_page.get(name.split("/")[-1], (None, None))
+        m = per_page.get(name)
+        canvas = m.canvas if m else None
         # a paper UUID may be an internal id; map it to its real attachment
-        paper = paper_att.get(paper, paper) if paper else None
-        size = _paper_size(opener, names, paper) if canvas else None
+        paper = paper_att.get(m.paper, m.paper) if m and m.paper else None
+        ppage = m.paper_page if m else 0
+        size = sizes.get(paper, ppage) if canvas else None
         page = parse_page(opener(name), attachments, canvas, size)
         if paper and paper in attachments:
             page.background = attachments[paper]
+            page.background_page = ppage
         pages.append(page)
     return pages
 
@@ -135,36 +157,53 @@ def _uuid_from(v) -> Optional[str]:
     return m.group(1).decode("ascii").upper() if m else None
 
 
-def _paper_size(opener, names, paper) -> Optional[Tuple[float, float]]:
-    """Page size from a paper PDF attachment's MediaBox ``[0 0 W H]``."""
-    if not paper or f"attachments/{paper}" not in names:
-        return None
-    try:
-        data = opener(f"attachments/{paper}")
-    except Exception:
-        return None
-    if not data.startswith(b"%PDF"):
-        return None
-    m = re.search(
-        rb"/MediaBox\s*\[\s*([\d.]+)\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)\s*\]", data)
+class _PaperSizes:
+    """Page sizes of paper PDFs, per (attachment, page), cached.
+
+    With pypdfium2 installed the exact size of the requested page is used
+    (multi-page imported PDFs can mix sizes); without it, the first
+    ``/MediaBox`` in the file.
+    """
+
+    def __init__(self, attachments: Dict[str, bytes]):
+        self._attachments = attachments
+        self._sizes: Dict[str, List[Tuple[float, float]]] = {}
+
+    def get(self, paper: Optional[str], page: int) -> Optional[Tuple[float, float]]:
+        data = self._attachments.get(paper or "")
+        if not data or not data.startswith(b"%PDF"):
+            return None
+        if paper not in self._sizes:
+            self._sizes[paper] = _pdf_page_sizes(data)
+        sizes = self._sizes[paper]
+        if not sizes:
+            return None
+        return sizes[page] if page < len(sizes) else sizes[0]
+
+
+def _pdf_page_sizes(data: bytes) -> List[Tuple[float, float]]:
+    if _pdfium is not None:
+        try:
+            doc = _pdfium.PdfDocument(data)
+            try:
+                return [tuple(doc.get_page_size(i)) for i in range(len(doc))]
+            finally:
+                doc.close()
+        except Exception:
+            pass
+    m = re.search(rb"/MediaBox\s*\[\s*(-?[\d.]+)\s+(-?[\d.]+)\s+([\d.]+)\s+([\d.]+)\s*\]", data)
     if not m:
-        m = re.search(rb"/MediaBox\s*\[0\s+0\s+([\d.]+)\s+([\d.]+)\]", data)
-        if m:
-            return (float(m.group(1)), float(m.group(2)))
-        return None
-    return (float(m.group(3)), float(m.group(4)))
+        return []
+    return [(float(m.group(3)) - float(m.group(1)), float(m.group(4)) - float(m.group(2)))]
 
 
-def _read_page_meta(opener, names, member_names) -> List[Tuple[str, str,
-                                                                Optional[Tuple[float, float]], Optional[str]]]:
-    """Derive per-page metadata from ``index.events.pb``.
+def _read_page_meta(opener, names, member_names) -> List[PageMeta]:
+    """Derive per-page metadata from ``index.events.pb``, in display order.
 
-    Returns ``[(member_name, layer, canvas_wh_or_None, paper_uuid_or_None)]`` in
-    display order.  Each entry resolves a page's ``f54`` create op (page UUID in
-    field 2, layer in field 3) to that layer's create-info op (top field 1 =
-    layer, nested field ``f2.f4`` = paper, ``f2.f8`` = canvas dims).  When the
-    event log is absent or carries no canvas dims this returns ``[]`` and the
-    caller falls back to the single global canvas/page size.
+    Each page's ``f54`` create op (page UUID ``f2``) names its layer; the
+    layer's create-info op (top ``f1`` = layer) holds the paper (``f2.f4``),
+    the page of a multi-page paper PDF (``f2.f5``, 1-based) and the canvas
+    size (``f2.f8``).  Returns ``[]`` without an event log.
     """
     if "index.events.pb" not in names:
         return []
@@ -178,7 +217,7 @@ def _read_page_meta(opener, names, member_names) -> List[Tuple[str, str,
         return []
 
     # 1) layer create-info ops: top f1 = layer UUID, f2 = info message.
-    layer_info: Dict[str, Tuple[Optional[str], Optional[Tuple[float, float]]]] = {}
+    layer_info: Dict[str, Tuple[Optional[str], Optional[Tuple[float, float]], int]] = {}
     for rec in recs:
         t = parse_message_tolerant(rec)
         if 1 not in t or 2 not in t:
@@ -189,9 +228,13 @@ def _read_page_meta(opener, names, member_names) -> List[Tuple[str, str,
             continue
         paper: Optional[str] = None
         cxy: Optional[Tuple[float, float]] = None
+        paper_page = 0
         for f, _wt, v in iter_fields_tolerant(info):
             if f == 4:
                 paper = _uuid_from(v) or paper
+            elif f == 5 and isinstance(v, int) and v >= 1:
+                # 1-based page of a multi-page paper PDF (imported documents)
+                paper_page = v - 1
             elif f == 8 and isinstance(v, (bytes, bytearray)):
                 cf = parse_message_tolerant(v)
                 if 1 in cf and 2 in cf:
@@ -199,12 +242,12 @@ def _read_page_meta(opener, names, member_names) -> List[Tuple[str, str,
                     if 100 < w < 5000 and 100 < h < 5000:
                         cxy = (float(w), float(h))
         if cxy:
-            layer_info[layer] = (paper, cxy)
+            layer_info[layer] = (paper, cxy, paper_page)
         elif paper:
             # paper known but no canvas yet; keep the best (canvas) if seen
             prev = layer_info.get(layer)
             if not prev or not prev[1]:
-                layer_info[layer] = (paper, prev[1] if prev else None)
+                layer_info[layer] = (paper, prev[1] if prev else None, paper_page)
 
     # 2) pages.  Page properties are versioned registers
     #    ``{1: value, 2: {1: version}}``; the highest version wins.
@@ -244,12 +287,12 @@ def _read_page_meta(opener, names, member_names) -> List[Tuple[str, str,
                 assign(layer, page, body.get(3, [None])[0])
             else:
                 assign(position, page, body.get(3, [None])[0])
-    out: List[Tuple[str, str, Optional[Tuple[float, float]], Optional[str]]] = []
+    out: List[PageMeta] = []
     for page in created:
         member = member_prefix.get(page[:32])
         lay = _uuid_from(layer[page][1]) if page in layer else None
-        paper, cxy = layer_info.get(lay, (None, None)) if lay else (None, None)
-        out.append((member, lay, cxy, paper))
+        paper, cxy, ppage = layer_info.get(lay, (None, None, 0)) if lay else (None, None, 0)
+        out.append(PageMeta(member, lay, cxy, paper, ppage))
     # Stable sort: pages without a key keep their creation order at the front.
     keyed = sorted(range(len(out)),
                    key=lambda i: position.get(created[i], (0, b""))[1])

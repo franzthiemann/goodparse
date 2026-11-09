@@ -248,14 +248,18 @@ def _raster_to_jpeg(data: bytes, place_w: float = 0.0,
     return rgb.width, rgb.height, buf.getvalue()
 
 
-def _background_to_jpeg(bg: bytes) -> Optional[Tuple[int, int, bytes]]:
-    """Render a background paper PDF's first page to an RGB JPEG XObject."""
+def _background_to_jpeg(bg: bytes, index: int = 0) -> Optional[Tuple[int, int, bytes]]:
+    """Render page ``index`` of a background paper PDF to an RGB JPEG."""
     if not _has_raster() or not bg:
         return None
     try:
         doc = _pdfium.PdfDocument(bg)
         try:
-            im = doc[0].render(scale=_BG_SCALE).to_pil().convert("RGB")
+            page = doc[index if index < len(doc) else 0]
+            bitmap = page.render(scale=_BG_SCALE)
+            im = bitmap.to_pil().convert("RGB")
+            bitmap.close()
+            page.close()
         finally:
             doc.close()
     except Exception:
@@ -407,7 +411,7 @@ def _page_content(page, width_scale: float, alpha_name: Dict[float, str],
 
     # --- background (drawn first, so everything sits on top) ---------------- #
     if _has_raster() and page.background:
-        bg = _background_to_jpeg(page.background)
+        bg = _background_to_jpeg(page.background, page.background_page)
         if bg:
             w, hh, jpg = bg
             num = take_num()

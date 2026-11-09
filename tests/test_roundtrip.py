@@ -601,12 +601,12 @@ def test_pdf_text_is_drawn_and_extractable(tmp_path):
 # --------------------------------------------------------------------------- #
 
 def _all_stroke_blobs():
-    import glob
     import zipfile
 
     from goodparse.applelz4 import is_apple_lz4
     from goodparse.records import read_page_objects
-    for path in sorted(glob.glob(os.path.join(SAMPLES, "*.goodnotes"))):
+    from visual import committed_samples
+    for path in (os.path.join(SAMPLES, f) for f in committed_samples()):
         with zipfile.ZipFile(path) as z:
             for n in z.namelist():
                 if not n.startswith("notes/"):
@@ -707,3 +707,77 @@ def test_font_matcher_rejects_fontconfig_substitutes(monkeypatch):
 
     monkeypatch.setattr(subprocess, "run", lambda *a, **k: Out())
     assert fe.find_font_file("Avenir", False, False) is None
+
+
+# --------------------------------------------------------------------------- #
+# Synthetic: newer pressure layout with a default width, multi-page papers
+# --------------------------------------------------------------------------- #
+
+def _tpl(sig: bytes, body: bytes) -> bytes:
+    import struct
+    raw = b"tpl\0" + b"\0\0\0\0" + sig + b"\0" + body
+    return raw[:4] + struct.pack("<I", len(raw)) + raw[8:]
+
+
+def test_newer_pressure_layout_mixes_own_and_default_widths():
+    import struct
+
+    from goodparse.ink import decode_ink
+    sig = b"vuA(v)A(u)A(u)A(v)A(v)A(u)A(u)A(u)A(u)A(v)"
+    flags = [0, 1, 3]          # move (default r), segment (default r), segment (own r)
+    start = [0.0, 0.0]         # x y
+    seg = [5.0, 0.0, 10.0, 0.0,                # cx cy ex ey
+           15.0, 0.0, 20.0, 0.0, 2.0, 4.0]     # cx cy ex ey cr er
+    body = struct.pack("<Hf", 2, 0.5)
+    body += struct.pack("<I", len(flags)) + b"".join(struct.pack("<H", f) for f in flags)
+    body += struct.pack("<I", len(start)) + struct.pack(f"<{len(start)}f", *start)
+    body += struct.pack("<I", len(seg)) + struct.pack(f"<{len(seg)}f", *seg)
+    body += struct.pack("<I", 0) * 7   # the remaining (unused) arrays, empty
+    (path,) = decode_ink(_tpl(sig, body)).subpaths
+    assert path[0] == (0.0, 0.0, 1.0)                     # 2 x default 0.5
+    assert path[-1] == pytest.approx((20.0, 0.0, 8.0))    # 2 x own 4.0
+
+
+def _pb(field: int, value) -> bytes:
+    import struct
+
+    def varint(n):
+        out = b""
+        while True:
+            b = n & 0x7F
+            n >>= 7
+            out += bytes([b | (0x80 if n else 0)])
+            if not n:
+                return out
+    if isinstance(value, int):
+        return varint(field << 3) + varint(value)
+    if isinstance(value, float):
+        return varint(field << 3 | 5) + struct.pack("<f", value)
+    return varint(field << 3 | 2) + varint(len(value)) + value
+
+
+def test_page_shows_its_page_of_a_multipage_paper(tmp_path):
+    import zipfile
+    pdfium = pytest.importorskip("pypdfium2")
+    paper = "AAAAAAAA-0000-0000-0000-000000000001"
+    layer = "BBBBBBBB-0000-0000-0000-000000000002"
+    page_id = "CCCCCCCC-0000-0000-0000-000000000003"
+    pdf = pdfium.PdfDocument.new()
+    for w, h in ((100, 100), (200, 100), (300, 150)):
+        pdf.new_page(w, h)
+    pdf_path = tmp_path / "paper.pdf"
+    pdf.save(str(pdf_path))
+    canvas = _pb(1, 550.0) + _pb(2, 275.0)
+    layer_info = _pb(1, layer.encode()) + _pb(2, _pb(4, paper.encode()) + _pb(5, 3) + _pb(8, canvas))
+    create = _pb(1, page_id.encode()) + _pb(54, _pb(2, page_id.encode()) + _pb(3, _pb(1, layer.encode())))
+    assert len(layer_info) < 128 and len(create) < 128  # single-byte length prefixes
+    events = b"".join(bytes([len(r)]) + r for r in (layer_info, create))
+    path = tmp_path / "doc.goodnotes"
+    with zipfile.ZipFile(path, "w") as z:
+        z.writestr("index.events.pb", events)
+        z.writestr(f"notes/{page_id}", b"")
+        z.writestr(f"attachments/{paper}", pdf_path.read_bytes())
+    (page,) = parse_goodnotes(str(path)).pages
+    assert page.background_page == 2
+    assert (page.width, page.height) == pytest.approx((300, 150))
+    assert page.scale == pytest.approx(300 / 550)
