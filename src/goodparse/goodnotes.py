@@ -44,9 +44,19 @@ from typing import Dict, List, Optional, Tuple
 
 from .applelz4 import apple_decompress, is_apple_lz4
 from .protobuf import (
+    get_bytes,
     iter_fields,
-    parse_message,
+    iter_fields_tolerant,
+    parse_message_tolerant,
     read_length_delimited_records,
+)
+from .records import (
+    KIND_IMAGE,
+    KIND_STROKE,
+    KIND_TEXT,
+    KIND_TEXTBOX,
+    PageObject,
+    read_page_objects,
 )
 from .text_rtf import TextLine, TextRun, parse_rtf_runs
 
@@ -226,11 +236,8 @@ def _flag_run_end(buf: bytes) -> int:
     one past that run's *end* (0 when there is none).
     """
     run = 0
-    start = 0
     for i in range(8, len(buf)):
         if buf[i] in (0, 1):
-            if run == 0:
-                start = i
             run += 1
         else:
             if run >= 30:
@@ -649,7 +656,7 @@ def _vector_shape_points(content_fields) -> List[Tuple[float, float]]:
             continue
         top: List[Tuple[int, int, bytes]] = []
         try:
-            top = [(f, wt, bytes(v)) for f, wt, v in _iter_fields_tolerant(blob)
+            top = [(f, wt, bytes(v)) for f, wt, v in iter_fields_tolerant(blob)
                    if isinstance(v, (bytes, bytearray))]
         except (ValueError, struct.error):
             continue
@@ -698,7 +705,7 @@ def _vector_oval_points(content_fields) -> List[Tuple[float, float]]:
             continue
         f4 = None
         try:
-            for f, _wt, v in _iter_fields_tolerant(blob):
+            for f, _wt, v in iter_fields_tolerant(blob):
                 if f == 4 and isinstance(v, (bytes, bytearray)):
                     f4 = bytes(v)
                     break
@@ -709,7 +716,7 @@ def _vector_oval_points(content_fields) -> List[Tuple[float, float]]:
         cx = cy = rx = ry = None
         rot = 0.0
         try:
-            sub = {f: v for f, _wt, v in _iter_fields_tolerant(f4)}
+            sub = {f: v for f, _wt, v in iter_fields_tolerant(f4)}
         except (ValueError, struct.error):
             continue
         c = sub.get(1)
@@ -744,42 +751,6 @@ def _vector_oval_points(content_fields) -> List[Tuple[float, float]]:
 # Placement matrix helpers (shared by images and text boxes)
 # --------------------------------------------------------------------------- #
 
-def _read_varint(data: bytes, i: int) -> Tuple[int, int]:
-    shift = 0
-    result = 0
-    while True:
-        b = data[i]
-        i += 1
-        result |= (b & 0x7F) << shift
-        if not (b & 0x80):
-            return result, i
-        shift += 7
-
-
-def _get_blob(b: bytes, field_no: int) -> Optional[bytes]:
-    """Fetch the raw bytes of a single length-delimited field."""
-    i = 0
-    n = len(b)
-    while i < n:
-        key, i = _read_varint(b, i)
-        fno = key >> 3
-        wt = key & 7
-        if wt == 2:
-            ln, i = _read_varint(b, i)
-            if fno == field_no:
-                return b[i:i + ln]
-            i += ln
-        elif wt == 0:
-            _, i = _read_varint(b, i)
-        elif wt == 5:
-            i += 4
-        elif wt == 1:
-            i += 8
-        else:
-            break
-    return None
-
-
 def _point_xy(blob: bytes) -> Optional[Tuple[float, float]]:
     """Parse a point message: ``{1: f32 x, 2: f32 y}``."""
     d = {}
@@ -799,12 +770,12 @@ def _matrix_from(msg: bytes) -> Optional[Tuple[Tuple[float, float], Tuple[float,
     Field ``#2`` is a message holding two point messages (sub-fields 1 and 2).
     Returns ``(point1, point2)`` — for images/text: (top-left, size).
     """
-    f2 = _get_blob(msg, 2)
+    f2 = get_bytes(msg, 2)
     if not f2:
         return None
     pts = []
     for pno in (1, 2):
-        p = _get_blob(f2, pno)
+        p = get_bytes(f2, pno)
         if p:
             xy = _point_xy(p)
             if xy:
@@ -939,10 +910,10 @@ def _field21_position(f21: bytes) -> Optional[Tuple[float, float]]:
     The object transform is ``f21.f20``; its first point (``f20.f1``) is the
     origin.  Returns ``(x, y)`` or ``None``.
     """
-    f20 = _get_blob(f21, 20)
+    f20 = get_bytes(f21, 20)
     if not f20:
         return None
-    p1 = _get_blob(f20, 1)
+    p1 = get_bytes(f20, 1)
     if not p1:
         return None
     return _point_xy(p1)
@@ -1052,7 +1023,7 @@ def _shape_template_width(content_fields) -> Optional[float]:
         if not isinstance(blob, (bytes, bytearray)):
             continue
         try:
-            for f, _wt, v in _iter_fields_tolerant(blob):
+            for f, _wt, v in iter_fields_tolerant(blob):
                 if f == 15 and isinstance(v, float) and 0.05 < v < 200.0:
                     return v
         except (ValueError, struct.error):
@@ -1170,131 +1141,89 @@ def _parse_stroke(cf, scale: float = 1.0) -> Optional[Stroke]:
 def parse_page(data: bytes, attachments: Dict[str, bytes],
               canvas: Optional[Tuple[float, float]],
               page_size: Optional[Tuple[float, float]]) -> Page:
-    """Parse one ``notes/<UUID>`` page file into a :class:`Page`."""
+    """Parse one ``notes/<UUID>`` page file into a :class:`Page`.
+
+    Only live objects are drawn (see :mod:`goodparse.records`): deleted ones
+    stay in the file with a tombstone flag.
+    """
     page = Page()
     if page_size:
         page.width, page.height = page_size
     if canvas and page_size:
         page.scale = page_size[0] / canvas[0]
 
-    recs = list(read_length_delimited_records(data))
-
-    # collect images and their object IDs for matrix matching
-    pending_images: List[Tuple[Image, str]] = []
-
-    for rec in recs:
-        top = parse_message(rec)
-        # pen / highlighter / eraser strokes: content in field #7
-        for content in top.get(7, []):
-            if not isinstance(content, (bytes, bytearray)):
-                continue
-            cf = parse_message(content)
-            stroke = _parse_stroke(cf, scale=page.scale)
+    for obj in read_page_objects(data):
+        if obj.kind == KIND_STROKE:
+            stroke = _parse_stroke(obj.fields, scale=page.scale)
             if stroke:
                 page.strokes.append(stroke)
-        # images: top-level record with #4 = attachment UUID (no #7)
-        if top.get(4) and not top.get(7):
-            att0 = top[4][0]
-            if not isinstance(att0, (bytes, bytearray)):
-                continue
-            att = bytes(att0).decode("ascii", "ignore").strip()
-            img_data = attachments.get(att)
-            if img_data:
-                obj_id = ""
-                if top.get(1) and isinstance(top[1][0], (bytes, bytearray)):
-                    obj_id = bytes(top[1][0]).decode("ascii", "ignore").strip()
-                pending_images.append((
-                    Image(position=(0, 0), size=(0, 0),
-                          data=img_data, fmt=_raster_format(img_data)),
-                    obj_id,
-                ))
-        # text boxes: top-level record with field #8 (nested matrix + RTF)
-        for f8 in top.get(8, []):
-            if not isinstance(f8, (bytes, bytearray)):
-                continue
-            m = _matrix_from(f8)
-            if m:
-                top_left, size_vec = m
-                rtf = None
-                for k, _wt, v in iter_fields(f8):
-                    if isinstance(v, (bytes, bytearray)) and b"\\rtf1" in v:
-                        rtf = v
-                # GoodNotes text boxes here use black text (the RTF \colortbl is
-                # empty, meaning the default black).  The 15-byte sub-fields in
-                # the box message are geometry, not colour floats, so we keep
-                # the black default.
-                color = (0.0, 0.0, 0.0, 1.0)
-                if rtf is not None:
-                    lines = parse_rtf_runs(bytes(rtf))
-                    plain = "\n".join(ln.text().strip()
-                                      for ln in lines if ln.text().strip())
-                    # prefer the colour the RTF itself selects (default black)
-                    for ln in lines:
-                        if ln.runs:
-                            color = ln.runs[0].color
-                            break
-                    page.texts.append(TextBox(
-                        position=top_left, size=size_vec,
-                        rtf=bytes(rtf).decode("cp1252", "replace"),
-                        plain=plain, color=color, lines=lines,
-                    ))
-        # sticker text: top-level record with field #21 (Cocoa text run,
-        # ``bv41`` blob).  Unlike field-#8 boxes there is no RTF; the text,
-        # size (page points) and colour live in the run blob.
-        for f21 in top.get(21, []):
-            if not isinstance(f21, (bytes, bytearray)):
-                continue
-            f21 = bytes(f21)
-            pos = _field21_position(f21)
-            if not pos:
-                continue
-            f32 = _get_blob(f21, 32)
-            if not f32:
-                continue
-            dec = _decode_field21_text(bytes(f32))
-            if not dec or not dec["text"]:
-                continue
-            raw_color = dec["color"]
-            color: Tuple[float, float, float, float] = (
-                (raw_color
-                 if isinstance(raw_color, tuple) else (0.0, 0.0, 0.0, 1.0)))
-            raw_size = dec["size"]
-            size_pt = float(raw_size) if isinstance(raw_size, float) else 0.0
-            raw_fam = dec.get("family")
-            family = raw_fam if isinstance(raw_fam, str) else None
-            plain = str(dec["text"]).strip()
-            page.texts.append(TextBox(
-                position=pos, size=(1.0, 1.0),
-                rtf="", plain=plain, color=color,
-                lines=[TextLine(runs=[TextRun(
-                    text=plain, bold=True, color=color,
-                    font_family=family)])],
-                font_size=size_pt,
-            ))
-
-    # second pass: match images to their companion matrix records
-    for rec in recs:
-        top = parse_message(rec)
-        for nested in top.get(1, []):
-            if not isinstance(nested, (bytes, bytearray)):
-                continue
-            m = _matrix_from(nested)
-            if not m:
-                continue
-            nid = _get_blob(nested, 1)
-            if not nid:
-                continue
-            nid = nid.decode("ascii", "ignore").strip()
-            for i, (img, obj_id) in enumerate(pending_images):
-                if obj_id == nid:
-                    pos, sz = m
-                    img.position = pos
-                    img.size = sz
-                    page.images.append(img)
-                    pending_images.pop(i)
-                    break
-
+        elif obj.kind == KIND_IMAGE:
+            img = _parse_image(obj, attachments)
+            if img:
+                page.images.append(img)
+        elif obj.kind == KIND_TEXTBOX:
+            box = _parse_textbox(obj.body)
+            if box:
+                page.texts.append(box)
+        elif obj.kind == KIND_TEXT:
+            box = _parse_text_object(obj.body)
+            if box:
+                page.texts.append(box)
     return page
+
+
+def _parse_image(obj: PageObject, attachments: Dict[str, bytes]) -> Optional[Image]:
+    """Image object: attachment UUID in the header, placement matrix in the body."""
+    data = attachments.get(obj.attachment or "")
+    m = _matrix_from(obj.body)
+    if not data or not m:
+        return None
+    pos, size = m
+    return Image(position=pos, size=size, data=data, fmt=_raster_format(data))
+
+
+def _parse_textbox(f8: bytes) -> Optional[TextBox]:
+    """Field-#8 text box: placement matrix plus a Cocoa RTF document."""
+    m = _matrix_from(f8)
+    if not m:
+        return None
+    top_left, size_vec = m
+    rtf = None
+    for _k, _wt, v in iter_fields_tolerant(f8):
+        if isinstance(v, (bytes, bytearray)) and b"\\rtf1" in v:
+            rtf = bytes(v)
+    if rtf is None:
+        return None
+    lines = parse_rtf_runs(rtf)
+    plain = "\n".join(ln.text().strip() for ln in lines if ln.text().strip())
+    # The box colour is the first run's RTF colour (an empty \colortbl = black).
+    color = next((ln.runs[0].color for ln in lines if ln.runs), (0.0, 0.0, 0.0, 1.0))
+    return TextBox(position=top_left, size=size_vec,
+                   rtf=rtf.decode("cp1252", "replace"),
+                   plain=plain, color=color, lines=lines)
+
+
+def _parse_text_object(f21: bytes) -> Optional[TextBox]:
+    """Field-#21 text object: no RTF; text, size and colour live in a
+    ``bv41`` Cocoa run blob in ``f32``."""
+    pos = _field21_position(f21)
+    f32 = get_bytes(f21, 32)
+    if not pos or not f32:
+        return None
+    dec = _decode_field21_text(f32)
+    if not dec or not dec["text"]:
+        return None
+    raw_color = dec["color"]
+    color = raw_color if isinstance(raw_color, tuple) else (0.0, 0.0, 0.0, 1.0)
+    raw_size = dec["size"]
+    size_pt = float(raw_size) if isinstance(raw_size, float) else 0.0
+    raw_fam = dec.get("family")
+    family = raw_fam if isinstance(raw_fam, str) else None
+    plain = str(dec["text"]).strip()
+    return TextBox(position=pos, size=(1.0, 1.0), rtf="", plain=plain, color=color,
+                   lines=[TextLine(runs=[TextRun(text=plain, bold=True, color=color,
+                                                 font_family=family)])],
+                   font_size=size_pt)
 
 
 def _page_members(names) -> List[str]:
@@ -1320,7 +1249,7 @@ def _read_deleted_pages(opener, names) -> List[str]:
     deleted = set()
     for rec in read_length_delimited_records(data):
         try:
-            top = parse_message(rec)
+            top = parse_message_tolerant(rec)
         except Exception:
             continue
         f1 = top.get(1, [None])[0]
@@ -1355,7 +1284,7 @@ def _read_page_order(opener, names, fallback) -> List[str]:
     nameset = set(names)
     ordered = []
     for rec in read_length_delimited_records(data):
-        top = parse_message(rec)
+        top = parse_message_tolerant(rec)
         if top.get(1) and isinstance(top[1][0], (bytes, bytearray)):
             member = "notes/" + bytes(top[1][0]).decode("ascii", "ignore").strip()
             if member in nameset and member not in ordered:
@@ -1388,7 +1317,7 @@ def _read_page_backgrounds(opener, names) -> Dict[str, str]:
     creations: List[str] = []   # page UUIDs, creation order
     papers: List[str] = []      # paper UUIDs, assignment order
     for rec in read_length_delimited_records(data):
-        top = parse_message(rec)
+        top = parse_message_tolerant(rec)
         f1 = top.get(1, [None])[0]
         if not isinstance(f1, (bytes, bytearray)):
             continue
@@ -1483,50 +1412,6 @@ _UUID_RE = re.compile(
     rb"([0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12})")
 
 
-def _iter_fields_tolerant(data: bytes):
-    """Yield protobuf fields, skipping the group wire-types (4/6) that current
-    GoodNotes uses in its index files, and stopping at a truncated/unknown field
-    instead of raising."""
-    i = 0
-    n = len(data)
-    while i < n:
-        if i + 1 > n:
-            return
-        key, i = _read_varint(data, i)
-        field = key >> 3
-        wt = key & 7
-        if wt == 0:
-            val, i = _read_varint(data, i)
-            yield field, wt, val
-        elif wt == 2:
-            ln, i = _read_varint(data, i)
-            if i + ln > n:
-                return
-            yield field, wt, data[i:i + ln]
-            i += ln
-        elif wt == 5:
-            if i + 4 > n:
-                return
-            yield field, wt, struct.unpack_from("<f", data, i)[0]
-            i += 4
-        elif wt == 1:
-            if i + 8 > n:
-                return
-            yield field, wt, struct.unpack_from("<d", data, i)[0]
-            i += 8
-        elif wt in (4, 6):  # group start/end marker, no payload
-            yield field, wt, None
-        else:
-            return
-
-
-def _fields_tolerant(data: bytes) -> Dict[int, List[object]]:
-    out: Dict[int, List[object]] = {}
-    for field, _wt, val in _iter_fields_tolerant(data):
-        out.setdefault(field, []).append(val)
-    return out
-
-
 def _uuid_from(v) -> Optional[str]:
     if not isinstance(v, (bytes, bytearray)):
         return None
@@ -1579,7 +1464,7 @@ def _read_page_meta(opener, names, member_names) -> List[Tuple[str, str,
     # 1) layer create-info ops: top f1 = layer UUID, f2 = info message.
     layer_info: Dict[str, Tuple[Optional[str], Optional[Tuple[float, float]]]] = {}
     for rec in recs:
-        t = _fields_tolerant(rec)
+        t = parse_message_tolerant(rec)
         if 1 not in t or 2 not in t:
             continue
         layer = _uuid_from(t[1][0])
@@ -1588,11 +1473,11 @@ def _read_page_meta(opener, names, member_names) -> List[Tuple[str, str,
             continue
         paper: Optional[str] = None
         cxy: Optional[Tuple[float, float]] = None
-        for f, _wt, v in _iter_fields_tolerant(info):
+        for f, _wt, v in iter_fields_tolerant(info):
             if f == 4:
                 paper = _uuid_from(v) or paper
             elif f == 8 and isinstance(v, (bytes, bytearray)):
-                cf = _fields_tolerant(v)
+                cf = parse_message_tolerant(v)
                 if 1 in cf and 2 in cf:
                     w, h = cf[1][0], cf[2][0]
                     if 100 < w < 5000 and 100 < h < 5000:
@@ -1610,11 +1495,11 @@ def _read_page_meta(opener, names, member_names) -> List[Tuple[str, str,
                      ((m[-36:][:32], m) for m in member_names)}
     out: List[Tuple[str, str, Optional[Tuple[float, float]], Optional[str]]] = []
     for rec in recs:
-        t = _fields_tolerant(rec)
+        t = parse_message_tolerant(rec)
         if 54 not in t:
             continue
         page = layer = None
-        for f, _wt, v in _iter_fields_tolerant(t[54][0]):
+        for f, _wt, v in iter_fields_tolerant(t[54][0]):
             if f == 2:
                 page = _uuid_from(v) or page
             elif f == 3:
@@ -1659,14 +1544,14 @@ def _read_paper_to_attachment(opener, names) -> Dict[str, str]:
     except Exception:
         return {}
     for rec in recs:
-        t = _fields_tolerant(rec)
+        t = parse_message_tolerant(rec)
         if 1 not in t or 6 not in t:
             continue
         paper = _uuid_from(t[1][0])
         v6 = t[6][0]
         if not paper or not isinstance(v6, (bytes, bytearray)):
             continue
-        sub = _fields_tolerant(v6)
+        sub = parse_message_tolerant(v6)
         if 2 in sub:
             att = _uuid_from(sub[2][0])
             if att:
@@ -1682,7 +1567,6 @@ def _read_page_size(opener, names) -> Optional[Tuple[float, float]]:
     PDFs share the same size we use it; otherwise we fall back to A4.
     """
     import re as _re
-    import zlib as _zlib
     sizes = set()
     for n in names:
         if not n.startswith("attachments/"):
