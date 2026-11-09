@@ -13,7 +13,11 @@ pytest.importorskip("PIL")
 
 from visual import compare, reference_samples  # noqa: E402  (tests/ is on sys.path)
 
-TOLERANCE = 0.05
+# Headroom for differences between machines, not between code versions: a
+# system without the URW font clones falls back to base-14 text (+0.06 on
+# Test9 p3 in a python:3.12-slim container), and rasteriser versions differ
+# slightly (+0.05).  The smallest real regression seen so far was +0.15.
+TOLERANCE = 0.10
 
 CEILINGS = {
     "Test4": [0.10, 3.55],
