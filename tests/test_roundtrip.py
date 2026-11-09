@@ -796,3 +796,24 @@ def test_rtf_skips_destination_groups():
     rtf = ("{\\rtf1{\\fonttbl\\f0 Helvetica;}{\\*\\listtable{\\list{\\*\\levelmarker \\{disc\\}}"
            "{\\leveltext \\'01\\uc0\\u8226 ;}}}\n\\pard\\ls1 {\\listtext\t\\'95\t}\\'95\tItem \\{x\\}}")
     assert [ln.text() for ln in parse_rtf_runs(rtf)] == ["•\tItem {x}"]
+
+
+def test_connector_elbow_routes_and_arrowhead():
+    from goodparse.page import _parse_connector
+
+    def pt(x, y):
+        return _pb(1, x) + _pb(2, y)
+
+    def body(vertical_first):
+        f21 = (_pb(1, _pb(1, pt(10.0, 10.0))) + _pb(2, pt(50.0, 30.0))
+               + _pb(3, _pb(1, pt(100.0, 60.0))) + _pb(5, _pb(2, pt(55.0, 35.0))))
+        if vertical_first:
+            f21 += _pb(4, 1)
+        f32 = _pb(1, 1.2) + _pb(3, _pb(1, _pb(1, 0.5) + _pb(4, 1.0)))
+        return _pb(21, f21) + _pb(32, f32)
+
+    line, arrow = _parse_connector(body(False))
+    assert [p[:2] for p in line.points] == [(10, 10), (50, 10), (50, 60), (100, 60)]
+    line, _ = _parse_connector(body(True))
+    assert [p[:2] for p in line.points] == [(10, 10), (10, 30), (100, 30), (100, 60)]
+    assert arrow.fill == arrow.color and arrow.points[0][:2] == (100, 60)

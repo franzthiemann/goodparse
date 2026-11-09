@@ -130,7 +130,10 @@ exports (`samples/*.pdf`).
 **Page object log** ([`records.py`](src/goodparse/records.py)). Each object is a
 *header* record (object UUID, version, `f3 = 1` when **deleted**) followed by a
 *body* record whose single field number is the object kind: `7` stroke/shape,
-`9` shape fill, `8` RTF text box, `21` text object, `1` image placement.
+`9` shape fill, `8` RTF text box, `21` text object, `1` image placement,
+`22` connector (elbow arrow), `12` document-flow paragraph. An image's file is
+named by its header `f7` (a derived UUID, e.g. in pages copied between
+notebooks) or else `f4`.
 Deleted objects stay in the file and must be skipped. A moved object keeps its
 geometry and stores the move as a translation in `f6`.
 
@@ -160,7 +163,8 @@ text boxes hold Cocoa RTF.
 
 **Pages** ([`archive.py`](src/goodparse/archive.py)). Page properties in the
 event log are versioned registers: each page has a paper layer (which gives
-its canvas size and paper PDF) and a **fractional-index position key**; moving
+its canvas size, its paper PDF and — for imported documents — the page of a
+multi-page paper PDF) and a **fractional-index position key**; moving
 a page or changing its paper writes a newer version. Display order is the
 bytewise order of the position keys, not creation order.
 
@@ -180,6 +184,10 @@ and PDF (`.pdf`). `tests/test_visual.py` scores every page of every sample
 against GoodNotes' own export and fails on any regression.
 
 Known gaps:
+
+- **Document-flow text** (kind 12: paragraphs of a page-wide text with no
+  stored position, ordered by a paragraph index) is not rendered yet; its
+  page placement is unknown.
 
 - **Pencil** is drawn as flat colour at reduced opacity; GoodNotes renders a
   grain texture that builds up where strokes overlap, which flat colour can

@@ -18,6 +18,8 @@ pair per page object:
   8     text box (matrix + RTF)
   9     shape fill (bounding box, geometry copy, ``f5`` target stroke)
   21    text object (Cocoa run blob)
+  22    connector (arrow between two points, see ``goodparse.page``)
+  12    document-flow paragraph (RTF, no geometry; not rendered yet)
   ====  =============================================================
 
 Editing an object rewrites its pair in place (no object id occurs twice in
@@ -37,6 +39,7 @@ KIND_STROKE = 7
 KIND_TEXTBOX = 8
 KIND_FILL = 9
 KIND_TEXT = 21
+KIND_CONNECTOR = 22
 
 
 @dataclass

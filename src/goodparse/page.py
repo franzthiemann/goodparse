@@ -11,10 +11,11 @@ import warnings
 from typing import Dict, List, Optional, Tuple
 
 from .applelz4 import apple_decompress, is_apple_lz4
-from .ink import TemplateError, decode_ink
+from .ink import UNIFORM_WIDTH_FACTOR, TemplateError, decode_ink
 from .model import Image, Page, Stroke, TextBox
 from .protobuf import get_bytes, iter_fields_tolerant, parse_message_tolerant
 from .records import (
+    KIND_CONNECTOR,
     KIND_FILL,
     KIND_IMAGE,
     KIND_STROKE,
@@ -188,6 +189,8 @@ def parse_page(data: bytes, attachments: Dict[str, bytes],
             box = _parse_text_object(obj.body)
             if box:
                 page.texts.append(box)
+        elif obj.kind == KIND_CONNECTOR:
+            page.strokes.extend(_parse_connector(obj.body))
     for obj in fills:
         _apply_fill(obj, by_id)
     # The file lists strokes topmost-first; expose them in paint order
@@ -255,3 +258,66 @@ def _parse_text_object(f21: bytes) -> Optional[TextBox]:
     size = max((r.size or obj.font_size) for ln in obj.lines for r in ln.runs)
     return TextBox(position=obj.position, size=obj.size, rtf="", plain=plain,
                    color=color, lines=obj.lines, font_size=size)
+
+
+# Arrowhead size relative to the connector's line width, read off the
+# real-world reference (approximate: the export draws a small filled head).
+_ARROW_LENGTH = 5.0
+_ARROW_HALF_WIDTH = 2.5
+
+
+def _parse_connector(body: bytes) -> List[Stroke]:
+    """Kind-22 connector: a line from ``f21.f1`` to ``f21.f3`` with an
+    arrowhead at the end.
+
+    ``f21.f2``, when present, is the elbow point: the route runs
+    horizontal-vertical-horizontal through its x, or vertical-horizontal-
+    vertical through its y when ``f21.f4 = 1`` (both confirmed against the
+    reference).  Without it the connector is straight.  ``f21.f5`` is the
+    midpoint (label anchor).  ``f32.f1`` is the width (uniform-stroke units),
+    ``f32.f3.f1`` the RGBA colour.  ``f31 = 2`` on every connector seen, all
+    drawn with an end arrowhead.
+    """
+    f21b = get_bytes(body, 21)
+    f32b = get_bytes(body, 32)
+    if not f21b or not f32b:
+        return []
+    f21 = parse_message_tolerant(f21b)
+
+    def anchor(field_no: int, inner: int):
+        v = f21.get(field_no, [None])[0]
+        return _point_xy(get_bytes(bytes(v), inner)) if isinstance(v, (bytes, bytearray)) else None
+
+    start, end = anchor(1, 1), anchor(3, 1)
+    if not start or not end:
+        return []
+    route = [start, end]
+    elbow = _point_xy(f21.get(2, [None])[0])
+    if elbow:
+        if f21.get(4, [0])[0] == 1:
+            route = [start, (start[0], elbow[1]), (end[0], elbow[1]), end]
+        else:
+            route = [start, (elbow[0], start[1]), (elbow[0], end[1]), end]
+    style = parse_message_tolerant(f32b)
+    w = style.get(1, [None])[0]
+    w = (w if isinstance(w, float) and w > 0 else 1.0) * UNIFORM_WIDTH_FACTOR
+    colour_msg = get_bytes(get_bytes(f32b, 3) or b"", 1)
+    color = _rgba(colour_msg) or (0.0, 0.0, 0.0, 1.0)
+    line = Stroke(points=[(x, y, w) for x, y in route], color=color, kind="pen")
+
+    # Arrowhead along the last non-degenerate segment.
+    (x0, y0), (x1, y1) = route[-2], route[-1]
+    for a, b in zip(route[-2::-1], route[:0:-1]):
+        if a != b:
+            (x0, y0), (x1, y1) = a, b
+            break
+    length = ((x1 - x0) ** 2 + (y1 - y0) ** 2) ** 0.5
+    if length == 0:
+        return [line]
+    ux, uy = (x1 - x0) / length, (y1 - y0) / length
+    hl, hw = _ARROW_LENGTH * w, _ARROW_HALF_WIDTH * w
+    bx, by = x1 - ux * hl, y1 - uy * hl
+    head = [(x1, y1), (bx - uy * hw, by + ux * hw), (bx + uy * hw, by - ux * hw), (x1, y1)]
+    arrow = Stroke(points=[(x, y, w * 0.5) for x, y in head], color=color,
+                   kind="pen", fill=color)
+    return [line, arrow]
