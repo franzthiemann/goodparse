@@ -79,6 +79,14 @@ class TextBox:
     # scaled by ``s`` at emit time).  0 = not present -> the emitter falls back
     # to guessing the size from the RTF (the field-8 text-box path).
     font_size: float = 0.0
+    # Pre-laid-out text (document-flow paragraphs): ``lines`` are final visual
+    # lines, spaced exactly ``line_height`` apart, the first baseline
+    # ``baseline_offset`` below ``position``'s y (canvas units).  0 = the
+    # writer lays the text out itself.
+    line_height: float = 0.0
+    baseline_offset: float = 0.0
+    # Box background fill (RGBA) when the box has one, else None.
+    background: Optional[Tuple[float, float, float, float]] = None
 
 
 @dataclass

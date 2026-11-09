@@ -123,11 +123,12 @@ def parse_rtf_runs(rtf) -> List[TextLine]:
         return (0.0, 0.0, 0.0, 1.0)
 
     lines: List[TextLine] = [TextLine()]
+    fs: Optional[float] = None  # ``\\fsN`` = N half-points -> canvas units
     cur = TextRun("")  # the in-progress run (created with the flags in effect)
 
     def new_cur():
         nonlocal cur
-        cur = TextRun("", bold, italic, underline, strike, color())
+        cur = TextRun("", bold, italic, underline, strike, color(), size=fs)
 
     def finish_run():
         if cur.text:
@@ -151,6 +152,8 @@ def parse_rtf_runs(rtf) -> List[TextLine]:
                 strike = num != "0"; changed = True
             elif word == "cf":
                 cf = int(num) if num else cf; changed = True
+            elif word == "fs" and num:
+                fs = int(num) / 2.0; changed = True
             elif word in ("par", "n", "line"):
                 finish_run()
                 lines.append(TextLine())

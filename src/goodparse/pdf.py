@@ -276,8 +276,11 @@ def _emit_text(parts: List[str], t: TextBox, s: float, h: float,
         return run_width(seg, size_of(run), base14_key(run))
 
     # 1) Greedy wrap on word pieces (each keeps its surrounding whitespace).
+    #    Pre-laid-out text (line_height set) keeps its lines as given.
     layout: List[Tuple[str, List[Tuple[str, TextRun]]]] = []
-    for line in lines:
+    if t.line_height > 0:
+        layout = [(ln.align, [(r.text, r) for r in ln.runs]) for ln in lines]
+    for line in (lines if t.line_height <= 0 else []):
         vlines: List[List[Tuple[str, TextRun]]] = [[]]
         used = 0.0
         for run in line.runs:
@@ -296,15 +299,18 @@ def _emit_text(parts: List[str], t: TextBox, s: float, h: float,
     #    proportion to each line's size instead of guessing font metrics.
     sizes = [max((size_of(run) for _seg, run in vl), default=box_fs) for _a, vl in layout]
     ratio = 0.0
-    if t.font_size > 0 and t.size[1] > 0 and sum(sizes) > 0:
+    if t.font_size > 0 and t.size[1] > 0 and sum(sizes) > 0 and t.line_height <= 0:
         ratio = t.size[1] * s / sum(sizes)
 
     # 3) Emit.
     y = t.position[1] * s
-    for (align, vl), fs_line in zip(layout, sizes):
-        line_h = fs_line * (ratio or 1.2)
-        baseline = h - (y + line_h * (0.8 if ratio else 2 / 3))
-        y += line_h
+    for j, ((align, vl), fs_line) in enumerate(zip(layout, sizes)):
+        if t.line_height > 0:
+            baseline = h - (y + (t.baseline_offset + j * t.line_height) * s)
+        else:
+            line_h = fs_line * (ratio or 1.2)
+            baseline = h - (y + line_h * (0.8 if ratio else 2 / 3))
+            y += line_h
         if not vl:
             continue
         line_w = sum(width(seg, run) for seg, run in vl[:-1])
@@ -406,6 +412,17 @@ def _page_content(page, width_scale: float, alpha_name: Dict[float, str],
             out.append(f"q {_num(pw, 2)} 0 0 {_num(ph, 2)} "
                        f"{_num(px, 2)} {_num(ypdf, 2)} cm /{name} Do Q")
 
+    # --- text-box backgrounds (beneath the ink) ----------------------------- #
+    for t in page.texts:
+        if t.background is not None:
+            r, g, b, a = t.background
+            x, y = t.position[0] * s, h - (t.position[1] + t.size[1]) * s
+            out.append("q")
+            if a < 1.0:
+                out.append(f"/{alpha_name[round(a, 4)]} gs")
+            out.append(f"{_num(r)} {_num(g)} {_num(b)} rg "
+                       f"{_num(x, 2)} {_num(y, 2)} {_num(t.size[0] * s, 2)} "
+                       f"{_num(t.size[1] * s, 2)} re f Q")
     # --- strokes (already in paint order) ----------------------------------- #
     for stroke in page.strokes:
         r, g, b, a = stroke.color
@@ -473,6 +490,10 @@ def build_pdf(doc: GoodNotesDocument, width_scale: float = 1.0) -> bytes:
         round(c[3], 4)
         for page in pages for s in page.strokes
         for c in (s.color, s.fill) if c is not None and c[3] < 1.0
+    } | {
+        round(t.background[3], 4)
+        for page in pages for t in page.texts
+        if t.background is not None and t.background[3] < 1.0
     })
     alpha_name = {a: f"GS{i}" for i, a in enumerate(alphas)}
     has_font = any(page.texts for page in pages)

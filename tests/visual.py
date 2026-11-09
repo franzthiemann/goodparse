@@ -1,7 +1,8 @@
 """Visual comparison of goodparse PDF output against GoodNotes' own export.
 
 Each ``samples/<name>.goodnotes`` that has a sibling ``<name>.pdf`` (exported
-from GoodNotes) is converted to PDF, both documents are rasterised, and every
+from GoodNotes; ``<name>_flat.pdf``, a flattened export, is preferred when
+present) is converted to PDF, both documents are rasterised, and every
 page gets a score: the mean absolute per-pixel difference (0..255, greyscale)
 after resizing ours to the reference raster.  0 = identical; a missing page or
 a page-size mismatch shows up as a large score.
@@ -65,6 +66,14 @@ def committed_samples() -> List[str]:
         return sorted(f for f in os.listdir(SAMPLES) if f.endswith(".goodnotes"))
 
 
+def reference_pdf(name: str) -> str:
+    """GoodNotes' export of sample ``name``: the *flattened* export when one
+    exists (``<name>_flat.pdf``), because the regular export drops the
+    indentation of "start typing" text (a GoodNotes bug), else ``<name>.pdf``."""
+    flat = os.path.join(SAMPLES, name + "_flat.pdf")
+    return flat if os.path.exists(flat) else os.path.join(SAMPLES, name + ".pdf")
+
+
 def reference_samples() -> List[str]:
     """Committed sample names (no extension) with a GoodNotes reference PDF."""
     names = []
@@ -78,7 +87,7 @@ def reference_samples() -> List[str]:
 def compare(name: str, outdir: Optional[str] = None) -> List[float]:
     """Return one score per page (max of both page counts) for sample ``name``."""
     src = os.path.join(SAMPLES, name + ".goodnotes")
-    ref = os.path.join(SAMPLES, name + ".pdf")
+    ref = reference_pdf(name)
     with tempfile.TemporaryDirectory() as tmp:
         ours_pdf = os.path.join(tmp, name + ".pdf")
         convert_file(src, ours_pdf)

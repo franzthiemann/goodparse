@@ -817,3 +817,31 @@ def test_connector_elbow_routes_and_arrowhead():
     line, _ = _parse_connector(body(True))
     assert [p[:2] for p in line.points] == [(10, 10), (10, 30), (100, 30), (100, 60)]
     assert arrow.fill == arrow.color and arrow.points[0][:2] == (100, 60)
+
+
+# --------------------------------------------------------------------------- #
+# "Start typing" flow text (Test_13; layout measured on the flattened export)
+# --------------------------------------------------------------------------- #
+
+def test_flow_text_layout_matches_measured_grid():
+    from goodparse.flowtext import FIRST_BASELINE, INDENT, MARGIN
+    page = parse_goodnotes(sample("Test_13.goodnotes")).pages[1]
+    boxes = {t.plain.split("\n")[0][:20]: t for t in page.texts}
+    head = boxes["This text is added w"]
+    assert head.position[1] + head.baseline_offset == pytest.approx(FIRST_BASELINE)
+    assert head.line_height == pytest.approx(29.3)
+    # indent levels: plain paragraphs at 44 + 31 * level
+    assert boxes["Get to the top of th"].position[0] == pytest.approx(MARGIN + INDENT)
+    assert boxes["Is the first thing y"].position[0] == pytest.approx(MARGIN + 2 * INDENT)
+    # numbering is per level, independent of the stale literal markers
+    numbers = [t.plain for t in page.texts if t.plain.endswith(".") and t.plain[:-1].isdigit()]
+    assert numbers == ["1.", "1.", "2.", "1."]
+    # ten bullets drawn as vector markers, filled on even levels
+    markers = [s for s in page.strokes if s.points[0][2] in (0.1, 0.7)]
+    assert len(markers) == 10
+
+
+def test_text_box_background_uses_protobuf_alpha():
+    # Default boxes store white without an alpha field (= transparent).
+    doc = parse_goodnotes(sample("Test7.goodnotes"))
+    assert all(t.background is None for p in doc.pages for t in p.texts)

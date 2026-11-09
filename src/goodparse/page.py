@@ -14,8 +14,10 @@ from .applelz4 import apple_decompress, is_apple_lz4
 from .ink import UNIFORM_WIDTH_FACTOR, TemplateError, decode_ink
 from .model import Image, Page, Stroke, TextBox
 from .protobuf import get_bytes, iter_fields_tolerant, parse_message_tolerant
+from .flowtext import layout_flow
 from .records import (
     KIND_CONNECTOR,
+    KIND_FLOW,
     KIND_FILL,
     KIND_IMAGE,
     KIND_STROKE,
@@ -168,6 +170,7 @@ def parse_page(data: bytes, attachments: Dict[str, bytes],
         page.scale = page_size[0] / canvas[0]
 
     by_id: Dict[str, Stroke] = {}
+    flow: List[PageObject] = []
     fills: List[PageObject] = []
     for obj in read_page_objects(data):
         if obj.kind == KIND_STROKE:
@@ -191,8 +194,15 @@ def parse_page(data: bytes, attachments: Dict[str, bytes],
                 page.texts.append(box)
         elif obj.kind == KIND_CONNECTOR:
             page.strokes.extend(_parse_connector(obj.body))
+        elif obj.kind == KIND_FLOW:
+            flow.append(obj)
     for obj in fills:
         _apply_fill(obj, by_id)
+    if flow:
+        canvas_w = canvas[0] if canvas else page.width / page.scale
+        texts, marks = layout_flow(flow, canvas_w)
+        page.texts.extend(texts)
+        page.strokes.extend(marks)
     # The file lists strokes topmost-first; expose them in paint order
     # (bottom-most first) so every writer can simply draw them in sequence.
     page.strokes.reverse()
@@ -243,9 +253,17 @@ def _parse_textbox(f8: bytes) -> Optional[TextBox]:
     plain = "\n".join(ln.text().strip() for ln in lines if ln.text().strip())
     # The box colour is the first run's RTF colour (an empty \colortbl = black).
     color = next((ln.runs[0].color for ln in lines if ln.runs), (0.0, 0.0, 0.0, 1.0))
+    # f9 is the box fill, with plain protobuf semantics: an omitted alpha is
+    # 0, i.e. transparent (the default boxes store white without alpha; a
+    # styled box, e.g. preset ".tb-8", stores its colour with alpha 1).
+    bg = None
+    f9 = parse_message_tolerant(get_bytes(f8, 9) or b"")
+    rgba = [f9.get(k, [0.0])[0] for k in (1, 2, 3, 4)]
+    if all(isinstance(v, float) for v in rgba) and rgba[3] > 0:
+        bg = (rgba[0], rgba[1], rgba[2], rgba[3])
     return TextBox(position=top_left, size=size_vec,
                    rtf=rtf.decode("cp1252", "replace"),
-                   plain=plain, color=color, lines=lines)
+                   plain=plain, color=color, lines=lines, background=bg)
 
 
 def _parse_text_object(f21: bytes) -> Optional[TextBox]:

@@ -131,7 +131,9 @@ exports (`samples/*.pdf`).
 *header* record (object UUID, version, `f3 = 1` when **deleted**) followed by a
 *body* record whose single field number is the object kind: `7` stroke/shape,
 `9` shape fill, `8` RTF text box, `21` text object, `1` image placement,
-`22` connector (elbow arrow), `12` document-flow paragraph. An image's file is
+`22` connector (elbow arrow), `12` "start typing" paragraph (no geometry:
+GoodNotes lays these out as page-wide text with margins 44, 31 per indent
+level and a fixed line pitch). An image's file is
 named by its header `f7` (a derived UUID, e.g. in pages copied between
 notebooks) or else `f4`.
 Deleted objects stay in the file and must be skipped. A moved object keeps its
@@ -185,9 +187,12 @@ against GoodNotes' own export and fails on any regression.
 
 Known gaps:
 
-- **Document-flow text** (kind 12: paragraphs of a page-wide text with no
-  stored position, ordered by a paragraph index) is not rendered yet; its
-  page placement is unknown.
+- **"Start typing" text** is laid out from measured rules
+  ([`flowtext.py`](src/goodparse/flowtext.py)); GoodNotes breaks some heading
+  lines earlier than their width requires, which is not reproduced yet.
+- GoodNotes' regular PDF export drops the indentation of "start typing" text
+  (a GoodNotes bug); the visual tests therefore prefer a flattened export
+  (`<name>_flat.pdf`) as reference when one exists.
 
 - **Pencil** is drawn as flat colour at reduced opacity; GoodNotes renders a
   grain texture that builds up where strokes overlap, which flat colour can
