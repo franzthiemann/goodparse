@@ -1,18 +1,30 @@
 [build-system]
-requires = ["setuptools>=61.0"]
+requires = ["setuptools>=77.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "goodparse"
 version = "0.1.0"
-description = "Convert GoodNotes files to editable Xournal++ or Excalidraw documents, or PDF, preserving strokes."
+description = "Convert GoodNotes notebooks to editable Xournal++ or Excalidraw documents, or PDF: ink, shapes, text, images and paper."
 readme = "README.md"
 requires-python = ">=3.9"
-license = { text = "MIT" }
+license = "MIT"
+license-files = ["LICENSE"]
 authors = [{ name = "Franz Thiemann" }]
 keywords = ["goodnotes", "xournal", "xournalpp", "excalidraw", "pdf", "notes", "converter"]
 classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: End Users/Desktop",
+    "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Multimedia :: Graphics :: Graphics Conversion",
     "Topic :: Utilities",
 ]
 dependencies = [
@@ -24,6 +36,11 @@ dependencies = [
     "Pillow>=10.0",
     "pypdfium2>=4.30",
 ]
+
+[project.urls]
+Homepage = "https://github.com/franzthiemann/goodparse"
+Source = "https://github.com/franzthiemann/goodparse"
+Issues = "https://github.com/franzthiemann/goodparse/issues"
 
 [project.scripts]
 goodparse = "goodparse.cli:main"
